@@ -1,0 +1,39 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: ${{ matrix.os }} / Node.js ${{ matrix.node }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        node: [22.13.1, 24]
+    steps:
+      - uses: actions/checkout@v6
+      - uses: pnpm/action-setup@v6
+        with:
+          run_install: false
+      - uses: actions/setup-node@v6
+        with:
+          node-version: ${{ matrix.node }}
+          cache: pnpm
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Verify native Git version
+        run: pnpm check:git-version
+      - name: Enforce direct runtime dependency policy
+        run: pnpm check:runtime-dependencies
+      - name: Run offline default quality gate
+        run: pnpm check
+      - name: Inspect package contents
+        run: pnpm pack --dry-run
+      - name: Run opt-in fresh-cache package install integration
+        run: pnpm test:package-install
