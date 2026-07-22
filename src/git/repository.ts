@@ -332,11 +332,7 @@ export function assertMutationReady(
   expectedBranch: string,
   expectedHead: string,
 ): void {
-  const observation = {
-    branch: snapshot.branch,
-    head: snapshot.head,
-    operationState: snapshot.operationState,
-  };
+  const observation = mutationObservation(snapshot);
   if (snapshot.branch === null || snapshot.operationState !== "none") {
     throw new BridgeRejection({
       code: "UNSUPPORTED_REPOSITORY_STATE",
@@ -344,6 +340,29 @@ export function assertMutationReady(
       details: observation,
     });
   }
+  assertExpectedBranch(snapshot, expectedBranch, observation);
+  assertExpectedHead(snapshot, expectedHead, observation);
+}
+
+interface MutationObservation extends Readonly<Record<string, unknown>> {
+  readonly branch: string | null;
+  readonly head: string;
+  readonly operationState: GitOperationState;
+}
+
+function mutationObservation(snapshot: RepositorySnapshot): MutationObservation {
+  return {
+    branch: snapshot.branch,
+    head: snapshot.head,
+    operationState: snapshot.operationState,
+  };
+}
+
+function assertExpectedBranch(
+  snapshot: RepositorySnapshot,
+  expectedBranch: string | null,
+  observation: MutationObservation,
+): void {
   if (snapshot.branch !== expectedBranch) {
     throw new BridgeRejection({
       code: "BRANCH_MISMATCH",
@@ -351,6 +370,13 @@ export function assertMutationReady(
       details: { ...observation, expectedBranch, observedBranch: snapshot.branch },
     });
   }
+}
+
+function assertExpectedHead(
+  snapshot: RepositorySnapshot,
+  expectedHead: string,
+  observation: MutationObservation,
+): void {
   if (snapshot.head !== expectedHead) {
     throw new BridgeRejection({
       code: "HEAD_MISMATCH",
@@ -358,4 +384,21 @@ export function assertMutationReady(
       details: { ...observation, expectedHead, observedHead: snapshot.head },
     });
   }
+}
+
+export function assertSwitchCreateReady(
+  snapshot: RepositorySnapshot,
+  expectedBranch: string | null,
+  expectedHead: string,
+): void {
+  const observation = mutationObservation(snapshot);
+  if (snapshot.operationState !== "none") {
+    throw new BridgeRejection({
+      code: "UNSUPPORTED_REPOSITORY_STATE",
+      message: "Repository has an unsupported Git operation in progress",
+      details: observation,
+    });
+  }
+  assertExpectedBranch(snapshot, expectedBranch, observation);
+  assertExpectedHead(snapshot, expectedHead, observation);
 }

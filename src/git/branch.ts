@@ -4,12 +4,12 @@ import { BridgeRejection, type SwitchCreateData } from "../domain/result.js";
 import { assertWellFormedGitText } from "../domain/git-text.js";
 import type { SessionStore } from "../state/session-store.js";
 import { OPERATION_TIMEOUT_MS } from "../product.js";
-import { assertMutationReady, inspectRepository, type RepositorySnapshot } from "./repository.js";
+import { assertSwitchCreateReady, inspectRepository, type RepositorySnapshot } from "./repository.js";
 import { readStatus } from "./read.js";
 import type { GitCommandResult, GitRunner } from "./runner.js";
 
 type SwitchCreateRequest = Pick<GitSwitchCreateInput, "branch"> & {
-  readonly expectedBranch: string;
+  readonly expectedBranch: string | null;
   readonly expectedHead: string;
 };
 
@@ -18,7 +18,7 @@ export interface PreparedSwitchCreate {
 }
 
 export interface SwitchCreatePreflightObservation extends Readonly<Record<string, unknown>> {
-  readonly branch: string;
+  readonly branch: string | null;
   readonly head: string;
   readonly index_tree: string;
   readonly new_branch: string;
@@ -76,13 +76,13 @@ export async function prepareSwitchCreate(
 
   const before = await inspectRepository(runner, snapshot.root, signal);
   assertIdentity(snapshot, before);
-  assertMutationReady(before, input.expectedBranch, input.expectedHead);
+  assertSwitchCreateReady(before, input.expectedBranch, input.expectedHead);
   await sessions.assertNoActiveSession(before.repositoryId);
   if (!before.indexMatchesHead) reject("INDEX_NOT_EMPTY", "Branch creation requires an empty index");
 
   const finalBefore = await inspectRepository(runner, before.root, signal);
   assertIdentity(before, finalBefore);
-  assertMutationReady(finalBefore, input.expectedBranch, input.expectedHead);
+  assertSwitchCreateReady(finalBefore, input.expectedBranch, input.expectedHead);
   if (finalBefore.indexTree !== before.indexTree || finalBefore.headTree !== before.headTree) {
     reject("INDEX_NOT_EMPTY", "Repository index changed before branch creation");
   }
@@ -98,7 +98,7 @@ export function preparedSwitchCreateObservation(prepared: PreparedSwitchCreate):
   const state = preparedSwitches.get(prepared);
   if (state === undefined) reject("INVALID_INPUT", "Prepared branch creation authority is invalid or already consumed");
   return Object.freeze({
-    branch: state.snapshot.branch!,
+    branch: state.snapshot.branch,
     head: state.snapshot.head,
     index_tree: state.snapshot.indexTree,
     new_branch: state.branch,

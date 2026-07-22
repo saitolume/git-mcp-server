@@ -71,6 +71,7 @@ async function mutationFixture(
     releaseFails?: boolean;
     releaseDiagnostics?: string[];
     journalOptions?: Readonly<Record<string, unknown>>;
+    detached?: boolean;
   } = {},
 ) {
   const root = await mkdtemp(join(tmpdir(), "git-mcp-server-publication-"));
@@ -86,6 +87,7 @@ async function mutationFixture(
   git(repository, ["config", "user.email", "publication@example.invalid"]);
   git(repository, ["config", "commit.gpgsign", "false"]);
   git(repository, ["commit", "--allow-empty", "-m", "initial"]);
+  if (options.detached === true) git(repository, ["checkout", "--detach"]);
   const runner = new PublicationRunner(await resolveGitExecutable(), process.env);
   const snapshot = await inspectRepository(runner, repository);
   const paths = await initializeStatePaths(resolveStatePaths({ platform: "linux", homedir: stateHome, env: {} }));
@@ -117,6 +119,28 @@ async function mutationFixture(
   const service = new DefaultBridgeService({ runner, lock, journal, sessions, coordinator });
   return { paths, repository, runner, snapshot, journal, service };
 }
+
+test("bridge replays detached switch create without a second Git mutation", async (t) => {
+  const fixture = await mutationFixture(t, async ({ path, record }) => {
+    await atomicCreateJson(path, record);
+  }, { detached: true });
+  const input = {
+    repository: fixture.repository,
+    request_id: "018f47d2-7b2a-7d75-b9dd-5ea8abca0045",
+    expected_branch: null,
+    expected_head: fixture.snapshot.head,
+    branch: "topic/detached-replay",
+  };
+
+  const first = await fixture.service.git_switch_create(input);
+  const replay = await fixture.service.git_switch_create(input);
+
+  assert.equal(first.status, "succeeded");
+  assert.deepEqual(replay, first);
+  assert.equal(fixture.runner.commands.filter(
+    ({ args }) => args[0] === "switch" && args[1] === "-c",
+  ).length, 1);
+});
 
 test("bridge mutation cannot use a stale worktree root when a shared-gitdir alias retargets", async (t) => {
   const root = await mkdtemp(join(tmpdir(), "git-mcp-server-alias-"));

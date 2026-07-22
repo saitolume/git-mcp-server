@@ -62,7 +62,7 @@ an MCP client's working directory may be undefined.
 | --- | --- |
 | `git_status` | Read repository identity, branch, HEAD, index/worktree state, and a worktree snapshot ID. |
 | `git_diff` | Return a byte-limited worktree or staged diff for declared paths. |
-| `git_switch_create` | Create and switch to a branch after branch and HEAD preflight. |
+| `git_switch_create` | Create and switch to a branch after exact attached-or-detached branch and HEAD preflight. |
 | `git_add` | Stage declared paths, or mark declared conflict paths resolved. |
 | `git_restore_staged` | Destructively unstage declared paths owned by a stage session. |
 | `git_restore_worktree` | Destructively restore declared paths after a worktree snapshot guard. |
@@ -76,9 +76,12 @@ an MCP client's working directory may be undefined.
 
 ## Typical workflow
 
-Call `git_status`, then explicitly call `git_add` for the paths intended for a
-commit, and finally call `git_commit`. For remote work, call `git_fetch`, then
-`git_merge`; when a merge reports conflicts, resolve the listed paths, call
+Call `git_status`. To create a branch from an attached branch, pass its exact
+name as `git_switch_create.expected_branch`; when `git_status` returns
+`branch: null`, pass `expected_branch: null` to require that exact detached
+`HEAD` before creating the branch. Then explicitly call `git_add` for the paths
+intended for a commit, and finally call `git_commit`. For remote work, call
+`git_fetch`, then `git_merge`; when a merge reports conflicts, resolve the listed paths, call
 `git_add`, and call `git_merge_continue`. Use `git_merge_abort` only when the
 declared merge must be abandoned. If transport is interrupted after a request,
 use the same request ID with `git_operation_get` to replay its durable result;
@@ -87,7 +90,9 @@ do not repeat the mutation.
 ## Safety boundaries
 
 Use only trusted repositories. Inputs are explicit repository-relative paths
-and mutations require expected branch and HEAD preconditions. Native hooks are
+and mutations require expected branch and HEAD preconditions. Only
+`git_switch_create` accepts a null expected branch, strictly meaning detached
+`HEAD`; other mutations require an attached branch name. Native hooks are
 enabled and may run repository-controlled code. Commits use `--no-gpg-sign`;
 the server does not bypass hooks. Review destructive restore, merge-abort,
 merge, and push operations before approving them.

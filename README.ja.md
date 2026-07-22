@@ -61,7 +61,7 @@ MCP client の working directory は未定義の場合があるため、checkout
 | --- | --- |
 | `git_status` | repository identity、branch、HEAD、index/worktree state、worktree snapshot ID を読む。 |
 | `git_diff` | 宣言した paths の byte-limited な worktree または staged diff を返す。 |
-| `git_switch_create` | branch と HEAD の preflight 後に branch を作成して切り替える。 |
+| `git_switch_create` | attached または detached の branch state と HEAD の exact preflight 後に branch を作成して切り替える。 |
 | `git_add` | 宣言した paths を stage するか、declared conflict paths を resolved にする。 |
 | `git_restore_staged` | stage session が所有する宣言済み paths を destructive に unstage する。 |
 | `git_restore_worktree` | worktree snapshot guard 後に宣言済み paths を destructive に restore する。 |
@@ -75,8 +75,11 @@ MCP client の working directory は未定義の場合があるため、checkout
 
 ## Typical workflow
 
-まず `git_status` を呼び、commit に含める paths だけを明示して `git_add` を呼び、
-最後に `git_commit` を呼びます。remote 作業では `git_fetch` の後に `git_merge` を
+まず `git_status` を呼びます。attached branch から branch を作成する場合は、その exact
+name を `git_switch_create.expected_branch` に渡します。`git_status` が `branch: null` を
+返した場合は `expected_branch: null` を渡し、その exact detached `HEAD` を precondition
+として branch を作成します。その後、commit に含める paths だけを明示して `git_add` を
+呼び、最後に `git_commit` を呼びます。remote 作業では `git_fetch` の後に `git_merge` を
 呼びます。merge が conflicts を返した場合は listed paths を解決して `git_add` を呼び、
 `git_merge_continue` を呼びます。declared merge を取りやめる必要がある場合だけ
 `git_merge_abort` を使います。request 後に transport が中断した場合は、同じ request ID
@@ -85,7 +88,9 @@ MCP client の working directory は未定義の場合があるため、checkout
 ## Safety boundaries
 
 trusted repositories だけで使ってください。inputs は明示的な repository-relative paths
-で、mutations には expected branch と HEAD preconditions が必要です。native hooks は
+で、mutations には expected branch と HEAD preconditions が必要です。null の expected
+branch を受け付けるのは `git_switch_create` だけで、厳密に detached `HEAD` を意味します。
+ほかの mutations には attached branch name が必要です。native hooks は
 enabled であり repository-controlled code を実行することがあります。commits は
 `--no-gpg-sign` を使います。server は hooks を bypass しません。destructive restore、
 merge-abort、merge、push は承認前に確認してください。
