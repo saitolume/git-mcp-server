@@ -1,6 +1,6 @@
 {
-  "name": "git-mcp-server",
-  "version": "0.0.0-development",
+  "name": "@saitolume/git-mcp-server",
+  "version": "0.1.0-beta.1",
   "description": "A constrained local Git MCP server for coding agents",
   "license": "MIT",
   "type": "module",
@@ -8,7 +8,11 @@
   "engines": { "node": ">=22" },
   "bin": { "git-mcp-server": "dist/cli.js" },
   "files": ["dist", "README.md", "README.ja.md", "LICENSE"],
-  "publishConfig": { "access": "public" },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/saitolume/git-mcp-server.git"
+  },
+  "publishConfig": { "access": "public", "tag": "beta" },
   "scripts": {
     "clean": "node --eval \"require('node:fs').rmSync('dist',{recursive:true,force:true});require('node:fs').rmSync('.test-dist',{recursive:true,force:true})\"",
     "build": "tsc -p tsconfig.build.json",

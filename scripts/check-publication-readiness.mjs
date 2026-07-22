@@ -2,7 +2,7 @@ import { spawnSync } from "node:child_process";
 import { lstatSync } from "node:fs";
 import { resolve } from "node:path";
 import { pathToFileURL } from "node:url";
-import { TextDecoder } from "node:util";
+import { isDeepStrictEqual, TextDecoder } from "node:util";
 
 export const EXPECTED_AUTHOR = "Tadao Iseki <me@saitolume.com>";
 export const ALLOWED_ROOTS = Object.freeze(["src/", "test/", "scripts/"]);
@@ -163,8 +163,14 @@ function inspectTrackedContents(repository, trackedEntries) {
 
 function inspectManifest(trackedPaths, textFiles) {
   const expected = {
-    name: "git-mcp-server",
+    name: "@saitolume/git-mcp-server",
+    version: "0.1.0-beta.1",
     license: "MIT",
+    repository: {
+      type: "git",
+      url: "git+https://github.com/saitolume/git-mcp-server.git",
+    },
+    publishConfig: { access: "public", tag: "beta" },
     packageManager: "pnpm@11.15.1",
     engines: { node: ">=22" },
   };
@@ -175,19 +181,14 @@ function inspectManifest(trackedPaths, textFiles) {
     const manifest = JSON.parse(manifestText);
     const actual = {
       name: manifest.name,
+      version: manifest.version,
       license: manifest.license,
+      repository: manifest.repository,
+      publishConfig: manifest.publishConfig,
       packageManager: manifest.packageManager,
       engines: manifest.engines,
     };
-    const enginesMatch = manifest.engines !== null
-      && typeof manifest.engines === "object"
-      && !Array.isArray(manifest.engines)
-      && Object.keys(manifest.engines).length === 1
-      && manifest.engines.node === expected.engines.node;
-    const matches = manifest.name === expected.name
-      && manifest.license === expected.license
-      && manifest.packageManager === expected.packageManager
-      && enginesMatch;
+    const matches = isDeepStrictEqual(actual, expected);
     return { matches, expected, actual };
   } catch (error) {
     return { matches: false, expected, actual: null, error: error instanceof Error ? error.message : String(error) };

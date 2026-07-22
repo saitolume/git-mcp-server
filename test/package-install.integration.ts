@@ -78,7 +78,7 @@ test("opt-in package install uses an isolated pnpm store and installed CLI", asy
     ["--config.ignore-scripts=true", "pack", "--json", "--pack-destination", workspace.tarballs],
     ["add", "--ignore-scripts", "--save-exact", packed.tarball],
   ]);
-  const installed = join(workspace.install, "node_modules", "git-mcp-server");
+  const installed = join(workspace.install, "node_modules", "@saitolume", "git-mcp-server");
   const resolved = await realpath(installed);
   assert.match(resolved, new RegExp(`^${escapeRegExp(workspace.root)}(?:/|$)`));
   assert.doesNotMatch(resolved, new RegExp(`^${escapeRegExp(repositoryRoot)}(?:/|$)`));

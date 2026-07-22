@@ -61,8 +61,14 @@ async function writeMinimalAllowedTree(
     "docs/architecture.md": "# Architecture\n",
     "docs/acceptance/provider-checklist.md": "# Provider checklist\n",
     "package.json": JSON.stringify(manifest ?? {
-      name: "git-mcp-server",
+      name: "@saitolume/git-mcp-server",
+      version: "0.1.0-beta.1",
       license: "MIT",
+      repository: {
+        type: "git",
+        url: "git+https://github.com/saitolume/git-mcp-server.git",
+      },
+      publishConfig: { access: "public", tag: "beta" },
       packageManager: "pnpm@11.15.1",
       engines: { node: ">=22" },
     }),
@@ -181,7 +187,15 @@ test("rejects wrong branch, configured remotes, dirty tracked files, manifest dr
     [{ branch: "trunk" }, "branch_main"],
     [{ remote: true }, "remote_absence"],
     [{ dirtyTrackedFile: true }, "tracked_clean"],
-    [{ manifest: { name: "wrong", license: "MIT", packageManager: "pnpm@11.15.1", engines: { node: ">=22" } } }, "manifest_contract"],
+    [{ manifest: {
+      name: "wrong",
+      version: "0.1.0-beta.1",
+      license: "MIT",
+      repository: { type: "git", url: "git+https://github.com/saitolume/git-mcp-server.git" },
+      publishConfig: { access: "public", tag: "beta" },
+      packageManager: "pnpm@11.15.1",
+      engines: { node: ">=22" },
+    } }, "manifest_contract"],
     [{ omitFile: "SECURITY.md" }, "required_public_files"],
   ];
   for (const [options, failure] of invalidCases) assertFailedCheck(runAudit(await createCandidate(options)), failure);
@@ -205,8 +219,14 @@ test("finds every forbidden privacy token without embedding those tokens in this
 
 test("rejects tracked symlinks without following an allowed package manifest symlink", async () => {
   const validManifest = JSON.stringify({
-    name: "git-mcp-server",
+    name: "@saitolume/git-mcp-server",
+    version: "0.1.0-beta.1",
     license: "MIT",
+    repository: {
+      type: "git",
+      url: "git+https://github.com/saitolume/git-mcp-server.git",
+    },
+    publishConfig: { access: "public", tag: "beta" },
     packageManager: "pnpm@11.15.1",
     engines: { node: ">=22" },
   });

@@ -18,9 +18,15 @@ test("default pnpm package contract packs without install or lifecycle recursion
   const manifest = JSON.parse(await readFile(join(repositoryRoot, "package.json"), "utf8")) as Record<string, unknown> & {
     engines?: { node?: string };
   };
+  assert.equal(manifest.name, "@saitolume/git-mcp-server");
+  assert.equal(manifest.version, "0.1.0-beta.1");
   assert.equal(manifest.license, "MIT");
+  assert.deepEqual(manifest.repository, {
+    type: "git",
+    url: "git+https://github.com/saitolume/git-mcp-server.git",
+  });
   assert.deepEqual(manifest.files, ["dist", "README.md", "README.ja.md", "LICENSE"]);
-  assert.deepEqual(manifest.publishConfig, { access: "public" });
+  assert.deepEqual(manifest.publishConfig, { access: "public", tag: "beta" });
   assert.equal(manifest.os, undefined);
   assert.equal(manifest.cpu, undefined);
   assert.deepEqual(manifest.dependencies, {
@@ -47,7 +53,7 @@ test("default pnpm package contract packs without install or lifecycle recursion
 
   const packed = packPackage(workspace);
   assert.deepEqual(workspace.pnpmCommands, [["--config.ignore-scripts=true", "pack", "--json", "--pack-destination", workspace.tarballs]]);
-  assert.equal(packed.filename, "git-mcp-server-0.0.0-development.tgz");
+  assert.equal(packed.filename, "saitolume-git-mcp-server-0.1.0-beta.1.tgz");
   await access(packed.tarball);
   assert.equal(packed.tarball.startsWith(`${workspace.tarballs}/`), true);
   const paths = packed.files;

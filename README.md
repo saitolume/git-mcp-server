@@ -6,14 +6,27 @@ an npm stable release or a general shell.
 
 ## Status
 
-This source is public under the MIT License. The package is not published.
-An npm stable release remains a separate gate: it needs an exact stable MCP SDK, a final package coordinate, provider acceptance, and hosted CI evidence.
+Version `0.1.0-beta.1` is the npm development preview of
+`@saitolume/git-mcp-server` and is distributed only under the `beta` tag. The
+`latest` tag and an npm stable release are not available. A stable release
+remains a separate gate: it needs an exact stable MCP SDK, provider acceptance
+across a broader set of clients, and hosted CI evidence.
 
 ## Requirements
 
 The built runtime requires Node.js >=22, native Git 2.39.0 or later on `PATH`,
 and a trusted local Git repository. Building from source requires Node.js
 >=22.13 and `pnpm@11.15.1`.
+
+## Run the beta
+
+Start the published development preview with the explicit `beta` tag:
+
+```sh
+npx --yes @saitolume/git-mcp-server@beta
+```
+
+Do not omit `@beta`; this preview does not use the `latest` tag.
 
 ## Build from source
 
@@ -26,19 +39,22 @@ pnpm build
 
 ## MCP configuration
 
-Run the built server with `node /absolute/path/dist/cli.js`. Use an absolute
-path to this checkout; no registry package installation is implied.
+Configure an MCP client to start the explicit npm beta:
 
 ```json
 {
   "mcpServers": {
     "git": {
-      "command": "node",
-      "args": ["/absolute/path/to/git-mcp-server/dist/cli.js"]
+      "command": "npx",
+      "args": ["--yes", "@saitolume/git-mcp-server@beta"]
     }
   }
 }
 ```
+
+For a source build, run the built server with
+`node /absolute/path/dist/cli.js`. Use an absolute path to the checkout because
+an MCP client's working directory may be undefined.
 
 ## Tools
 
@@ -96,8 +112,8 @@ Windows is not supported or promised.
 This development preview uses the exact beta MCP SDK versions declared in
 `package.json`. Run `pnpm check` for the local build and test contract, and
 `pnpm pack --dry-run --json` to inspect the package payload without publishing.
-The npm stable-release gates described in Status remain separate from making
-this source available on GitHub. See the
+The `beta` package remains separate from the npm stable-release gates described
+in Status. See the
 [provider checklist](docs/acceptance/provider-checklist.md) and
 [architecture](docs/architecture.md).
 

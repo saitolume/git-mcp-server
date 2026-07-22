@@ -6,15 +6,26 @@ npm stable release や汎用シェルではありません。
 
 ## Status
 
-このソースは MIT License で公開されています。package は publish されていません。
-npm stable release は別 gate です。exact stable MCP SDK、最終 package coordinate、
-provider acceptance、hosted CI の証跡が必要です。
+`0.1.0-beta.1` は `@saitolume/git-mcp-server` の npm development preview であり、
+`beta` tag だけで配布します。`latest` tag と npm stable release は提供しません。
+stable release は別 gate であり、exact stable MCP SDK、より広い provider acceptance、
+hosted CI の証跡が必要です。
 
 ## Requirements
 
 built runtime には Node.js >=22、`PATH` 上の native Git 2.39.0 以降、および trusted
 local Git repository が必要です。source build には Node.js >=22.13 と
 `pnpm@11.15.1` が必要です。
+
+## Beta の起動
+
+公開された development preview は明示的な `beta` tag で起動します。
+
+```sh
+npx --yes @saitolume/git-mcp-server@beta
+```
+
+`@beta` は省略しないでください。この preview は `latest` tag を使いません。
 
 ## Build from source
 
@@ -27,19 +38,22 @@ pnpm build
 
 ## MCP configuration
 
-built server は `node /absolute/path/dist/cli.js` で起動します。この checkout への
-absolute path を使ってください。registry package installation を前提にしません。
+MCP client には明示的な npm beta を起動するよう設定します。
 
 ```json
 {
   "mcpServers": {
     "git": {
-      "command": "node",
-      "args": ["/absolute/path/to/git-mcp-server/dist/cli.js"]
+      "command": "npx",
+      "args": ["--yes", "@saitolume/git-mcp-server@beta"]
     }
   }
 }
 ```
+
+source build を使う場合は `node /absolute/path/dist/cli.js` で built server を起動します。
+MCP client の working directory は未定義の場合があるため、checkout への absolute path
+を使ってください。
 
 ## Tools
 
@@ -95,8 +109,8 @@ Windows は support または promise の対象ではありません。
 
 この development preview は `package.json` で宣言した exact beta MCP SDK versions を
 使用します。local build/test contract には `pnpm check`、publish せず package payload を
-確認するには `pnpm pack --dry-run --json` を実行します。Status に記載した npm
-stable-release gates は、GitHub でこの source を公開することとは別です。
+確認するには `pnpm pack --dry-run --json` を実行します。`beta` package は Status に
+記載した npm stable-release gates とは別です。
 [provider checklist](docs/acceptance/provider-checklist.md) と
 [architecture](docs/architecture.md) を参照してください。
 

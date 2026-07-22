@@ -63,12 +63,15 @@ test("public documentation provides the published user contract", async () => {
       "pnpm install --frozen-lockfile",
       "pnpm build",
       "node /absolute/path/dist/cli.js",
+      "npx --yes @saitolume/git-mcp-server@beta",
+      "@saitolume/git-mcp-server",
+      "0.1.0-beta.1",
+      "latest",
       "git_operation_get",
       "pnpm@11.15.1",
       "22.13",
       "Private Vulnerability Reporting",
     ]) assert.match(readme, new RegExp(escapeRegExp(required)));
-    assert.doesNotMatch(readme, /\bnpx\b/);
     for (const retiredName of [
       ["Agent", "Git", "Bridge"].join(" "),
       ["agent", "git", "bridge"].join("-"),

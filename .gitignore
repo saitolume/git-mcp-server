@@ -1,5 +1,6 @@
 .worktrees/
 node_modules/
+.pnpm-store/
 dist/
 .test-dist/
 *.tgz
