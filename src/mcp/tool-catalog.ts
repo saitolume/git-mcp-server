@@ -96,7 +96,7 @@ export const TOOL_CATALOG = {
   },
   git_switch_create: {
     title: title("Create branch"),
-    description: "Operation: Create and switch to one new branch from the exact expected HEAD. Returns: request_id, repository_id, the created branch, and unchanged head; no session identifier. Defaults: the new branch starts at the exact expected HEAD. Excludes: existing branch checkout, force or reset, detached HEAD, dirty or untracked state, and remote access.",
+    description: "Operation: Create and switch to one new branch from the exact expected_branch and exact expected HEAD. Returns: request_id, repository_id, the created branch, and unchanged head; no session identifier. Defaults: a string expected_branch requires that attached branch, while null requires detached HEAD. Excludes: existing branch checkout, force or reset, branch or HEAD mismatch, dirty or untracked state, and remote access.",
     inputSchema: gitSwitchCreateInput,
     outputSchema: bridgeResultSchema(switchCreateDataSchema),
     annotations: mutationAnnotations,

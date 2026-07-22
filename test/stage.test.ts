@@ -295,6 +295,51 @@ test("switch create creates only a new branch from the exact clean HEAD", async 
   assert.deepEqual(runner.commands[switchIndex - 1]?.args, ["ls-files", "--stage", "-z"]);
 });
 
+test("switch create accepts only an exact clean detached HEAD precondition", async (t) => {
+  await t.test("creates a branch from detached HEAD", async (t) => {
+    const { directory, runner, sessions } = await fixture(t);
+    await runGit(runner, directory, ["checkout", "--detach"]);
+    const detached = await inspectRepository(runner, directory);
+    runner.commands.length = 0;
+
+    const result = await switchCreate(runner, sessions, detached, {
+      expectedBranch: null, expectedHead: detached.head, branch: "topic/detached",
+    });
+
+    assert.deepEqual(result, { branch: "topic/detached", head: detached.head });
+    assert.equal((await inspectRepository(runner, directory)).branch, "topic/detached");
+  });
+
+  for (const scenario of ["attached-null", "detached-string", "head-mismatch", "dirty"] as const) {
+    await t.test(scenario, async (t) => {
+      const { directory, runner, sessions, snapshot } = await fixture(t);
+      let current = snapshot;
+      let expectedBranch: string | null = null;
+      let expectedHead = snapshot.head;
+      let expectedCode = "BRANCH_MISMATCH";
+      if (scenario !== "attached-null") {
+        await runGit(runner, directory, ["checkout", "--detach"]);
+        current = await inspectRepository(runner, directory);
+      }
+      if (scenario === "detached-string") expectedBranch = "main";
+      if (scenario === "head-mismatch") {
+        expectedHead = "0".repeat(40);
+        expectedCode = "HEAD_MISMATCH";
+      }
+      if (scenario === "dirty") {
+        await writeFile(join(directory, "src", "a.ts"), "dirty\n");
+        expectedCode = "UNSUPPORTED_REPOSITORY_STATE";
+      }
+      runner.commands.length = 0;
+
+      await assert.rejects(switchCreate(runner, sessions, current, {
+        expectedBranch, expectedHead, branch: `topic/${scenario}`,
+      }), rejection(expectedCode));
+      assert.equal(runner.commands.some(({ args }) => args[0] === "switch"), false);
+    });
+  }
+});
+
 test("switch create proves exact state after caller abort during mutation", async (t) => {
   const { sessions, snapshot } = await fixture(t);
   const controller = new AbortController();

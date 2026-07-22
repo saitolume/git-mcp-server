@@ -70,6 +70,8 @@ export const gitDiffInput = z.strictObject({
 
 export const gitSwitchCreateInput = z.strictObject({
   ...mutationBase,
+  expected_branch: gitTransportText.min(1).nullable()
+    .describe("Exact current local branch expected before branch creation, or null to require detached HEAD; mismatch rejects without Git mutation."),
   branch: gitTransportText.min(1)
     .describe("New local branch name to create from the exact expected HEAD; existing or invalid refs are rejected."),
 });

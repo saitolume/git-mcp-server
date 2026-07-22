@@ -42,7 +42,7 @@ test("every tool declares complete annotations", () => {
 const DESCRIPTION_FRAGMENTS: Readonly<Record<ExpectedToolName, readonly string[]>> = {
   git_status: ["repository_id", "worktree_snapshot_id", "read-only"],
   git_diff: ["max_bytes", "1000000", "omitted paths", "read-only"],
-  git_switch_create: ["exact expected HEAD", "existing branch", "force"],
+  git_switch_create: ["exact expected HEAD", "expected_branch", "null", "detached HEAD", "existing branch", "force"],
   git_add: ["stage_id", "merge_session_id", "directories", "globs"],
   git_restore_staged: ["stage_id", "remaining", "worktree", "unowned"],
   git_restore_worktree: ["current index", "snapshot guard", "worktree_snapshot_id", "untracked"],
@@ -206,6 +206,20 @@ test("mutation schemas reject unknown fields and unsafe paths", () => {
     expected_branch: "main", expected_head: "a".repeat(40), paths: ["src/index.ts"],
     stage_id: "stage", merge_session_id: "merge",
   }).success, false);
+});
+
+test("only switch create accepts null as the exact detached HEAD branch precondition", () => {
+  const base = {
+    repository: "/repo",
+    request_id: "018f47d2-7b2a-7d75-b9dd-5ea8abca0006",
+    expected_branch: null,
+    expected_head: "a".repeat(40),
+  };
+  assert.equal(gitSwitchCreateInput.safeParse({ ...base, branch: "topic/detached" }).success, true);
+  assert.equal(gitAddInput.safeParse({ ...base, paths: ["src/index.ts"] }).success, false);
+
+  const schema = z.toJSONSchema(TOOL_CATALOG.git_switch_create.inputSchema) as JsonSchemaNode;
+  assert.match(schema.properties?.expected_branch?.description ?? "", /null.*detached HEAD|detached HEAD.*null/i);
 });
 
 test("Git output paths allow legal pathspec-looking names without weakening mutation inputs", () => {
