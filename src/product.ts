@@ -2,7 +2,7 @@ export const PRODUCT = Object.freeze({
   id: "git-mcp-server",
   displayName: "git-mcp-server",
   serverName: "git-mcp-server",
-  version: "0.1.0-beta.1",
+  version: "0.1.0-beta.2",
 });
 
 export const OPERATION_TIMEOUT_MS = Object.freeze({

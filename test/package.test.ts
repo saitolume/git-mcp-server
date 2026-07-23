@@ -19,7 +19,7 @@ test("default pnpm package contract packs without install or lifecycle recursion
     engines?: { node?: string };
   };
   assert.equal(manifest.name, "@saitolume/git-mcp-server");
-  assert.equal(manifest.version, "0.1.0-beta.1");
+  assert.equal(manifest.version, "0.1.0-beta.2");
   assert.equal(manifest.license, "MIT");
   assert.deepEqual(manifest.repository, {
     type: "git",
@@ -53,7 +53,7 @@ test("default pnpm package contract packs without install or lifecycle recursion
 
   const packed = packPackage(workspace);
   assert.deepEqual(workspace.pnpmCommands, [["--config.ignore-scripts=true", "pack", "--json", "--pack-destination", workspace.tarballs]]);
-  assert.equal(packed.filename, "saitolume-git-mcp-server-0.1.0-beta.1.tgz");
+  assert.equal(packed.filename, "saitolume-git-mcp-server-0.1.0-beta.2.tgz");
   await access(packed.tarball);
   assert.equal(packed.tarball.startsWith(`${workspace.tarballs}/`), true);
   const paths = packed.files;

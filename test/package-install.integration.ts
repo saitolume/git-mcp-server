@@ -99,7 +99,7 @@ test("opt-in package install uses an isolated pnpm store and installed CLI", asy
   git(["config", "user.email", "package-test@example.invalid"], fixture);
   await writeFile(join(fixture, "tracked.txt"), "installed package fixture\n", "utf8");
   git(["add", "tracked.txt"], fixture);
-  git(["commit", "-m", "initial"], fixture);
+  git(["commit", "--no-gpg-sign", "-m", "initial"], fixture);
   const head = git(["rev-parse", "HEAD"], fixture);
 
   environment.HOME = home;

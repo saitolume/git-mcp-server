@@ -6,7 +6,7 @@ npm stable release や汎用シェルではありません。
 
 ## Status
 
-`0.1.0-beta.1` は `@saitolume/git-mcp-server` の npm development preview であり、
+`0.1.0-beta.2` は `@saitolume/git-mcp-server` の npm development preview であり、
 `beta` tag だけで配布します。`latest` tag と npm stable release は提供しません。
 stable release は別 gate であり、exact stable MCP SDK、より広い provider acceptance、
 hosted CI の証跡が必要です。

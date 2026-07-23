@@ -6,7 +6,7 @@ an npm stable release or a general shell.
 
 ## Status
 
-Version `0.1.0-beta.1` is the npm development preview of
+Version `0.1.0-beta.2` is the npm development preview of
 `@saitolume/git-mcp-server` and is distributed only under the `beta` tag. The
 `latest` tag and an npm stable release are not available. A stable release
 remains a separate gate: it needs an exact stable MCP SDK, provider acceptance
