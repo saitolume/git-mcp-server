@@ -74,7 +74,7 @@ test("README states beta availability and separates stable-release gates", async
   assert.match(readme, /docs\/acceptance\/provider-checklist\.md/);
   assert.match(readme, /Git 2\.39\.0 or later/);
   assert.match(readme, /@saitolume\/git-mcp-server/);
-  assert.match(readme, /0\.1\.0-beta\.1/);
+  assert.match(readme, /0\.1\.0-beta\.2/);
   assert.match(readme, /latest[^.]*not available/i);
   for (const gate of [
     "exact stable MCP SDK",

@@ -20,7 +20,7 @@ test("product metadata is centralized", () => {
     id: "git-mcp-server",
     displayName: "git-mcp-server",
     serverName: "git-mcp-server",
-    version: "0.1.0-beta.1",
+    version: "0.1.0-beta.2",
   });
 });
 
@@ -50,6 +50,6 @@ test("operation timeouts match the approved policy", async () => {
 test("compiled CLI prints only the version for --version", () => {
   const result = spawnSync(process.execPath, [".test-dist/src/cli.js", "--version"], { encoding: "utf8" });
   assert.equal(result.status, 0);
-  assert.equal(result.stdout, "0.1.0-beta.1\n");
+  assert.equal(result.stdout, "0.1.0-beta.2\n");
   assert.equal(result.stderr, "");
 });

@@ -61,7 +61,21 @@ async function waitForMessage(
 
 test("startup recovery waits for a live mutation and preserves its single terminal result", async (t) => {
   const home = await import("node:fs/promises").then(({ mkdtemp }) => mkdtemp(join(tmpdir(), "git-mcp-server-server-recovery-")));
-  t.after(async () => rm(home, { recursive: true, force: true }));
+  let owner: ChildProcess | undefined;
+  let ownerCompleted = false;
+  let recoveryServer: ChildProcess | undefined;
+  let serverExited = false;
+  t.after(async () => {
+    if (recoveryServer !== undefined && !serverExited) {
+      recoveryServer.kill("SIGTERM");
+      await once(recoveryServer, "exit").catch(() => undefined);
+    }
+    if (owner !== undefined && !ownerCompleted && owner.exitCode === null && owner.signalCode === null) {
+      owner.kill("SIGKILL");
+      await once(owner, "exit").catch(() => undefined);
+    }
+    await rm(home, { recursive: true, force: true });
+  });
   const xdgStateHome = join(home, "xdg-state");
   const paths = await initializeStatePaths(resolveStatePaths({
     platform: process.platform,
@@ -85,31 +99,17 @@ test("startup recovery waits for a live mutation and preserves its single termin
   const encodedConfiguration = Buffer.from(JSON.stringify({
     paths, repository, repositoryId, requestId, sessionPath, objectId,
   }), "utf8").toString("base64url");
-  const owner = fork(workerPath, [encodedConfiguration], {
+  owner = fork(workerPath, [encodedConfiguration], {
     stdio: ["ignore", "ignore", "pipe", "ipc"],
-  });
-  let ownerCompleted = false;
-  t.after(async () => {
-    if (!ownerCompleted && owner.exitCode === null && owner.signalCode === null) {
-      owner.kill("SIGKILL");
-      await once(owner, "exit").catch(() => undefined);
-    }
   });
   await waitForMessage(owner, "ready");
 
   const cliPath = fileURLToPath(new URL("../src/cli.js", import.meta.url));
-  const recoveryServer = spawn(process.execPath, [cliPath], {
+  recoveryServer = spawn(process.execPath, [cliPath], {
     env: { ...process.env, HOME: home, XDG_STATE_HOME: xdgStateHome },
     stdio: ["pipe", "ignore", "pipe"],
   });
-  let serverExited = false;
   recoveryServer.once("exit", () => { serverExited = true; });
-  t.after(async () => {
-    if (!serverExited) {
-      recoveryServer.kill("SIGTERM");
-      await once(recoveryServer, "exit").catch(() => undefined);
-    }
-  });
 
   await delay(350);
   assert.equal(recoveryServer.exitCode, null, await readFile(sessionPath, "utf8"));

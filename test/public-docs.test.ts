@@ -65,7 +65,7 @@ test("public documentation provides the published user contract", async () => {
       "node /absolute/path/dist/cli.js",
       "npx --yes @saitolume/git-mcp-server@beta",
       "@saitolume/git-mcp-server",
-      "0.1.0-beta.1",
+      "0.1.0-beta.2",
       "latest",
       "git_operation_get",
       "pnpm@11.15.1",

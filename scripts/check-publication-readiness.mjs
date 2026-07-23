@@ -164,7 +164,7 @@ function inspectTrackedContents(repository, trackedEntries) {
 function inspectManifest(trackedPaths, textFiles) {
   const expected = {
     name: "@saitolume/git-mcp-server",
-    version: "0.1.0-beta.1",
+    version: "0.1.0-beta.2",
     license: "MIT",
     repository: {
       type: "git",
