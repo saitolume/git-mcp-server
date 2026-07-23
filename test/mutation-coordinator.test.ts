@@ -433,7 +433,11 @@ test("mutation coordinator persists an explicitly proven hook failure after muta
       order.push("mutation");
       throw new ProvenMutationOutcome({
         status: "failed", operation: request.operation, warnings: [],
-        error: { code: "HOOK_FAILED", message: "A configured commit hook rejected the commit" },
+        error: {
+          code: "HOOK_FAILED",
+          message: "A native commit hook rejected the commit",
+          details: { hook: "pre-commit" },
+        },
       });
     },
   });

@@ -1,8 +1,12 @@
 import { createHash } from "node:crypto";
 import { remainingDeadlineTimeoutMs, throwIfDeadlineExceeded, withReconciliationDeadline } from "../deadline.js";
 import type { BridgeResult, CommitData } from "../domain/result.js";
-import { BridgeRejection, commitDataSchema } from "../domain/result.js";
-import { gitOutputPath } from "../domain/inputs.js";
+import {
+  BridgeRejection,
+  commitDataSchema,
+  HOOK_FAILED_MESSAGE,
+} from "../domain/result.js";
+import { absoluteRepositoryPath, gitOutputPath } from "../domain/inputs.js";
 import { ProvenMutationOutcome } from "../app/mutation-coordinator.js";
 import { OPERATION_TIMEOUT_MS } from "../product.js";
 import type { StageRecord } from "../state/records.js";
@@ -15,6 +19,7 @@ import {
   type RepositorySnapshot,
 } from "./repository.js";
 import type { GitCommandResult, GitRunner } from "./runner.js";
+import { createHookWrappers } from "./hook-wrapper.js";
 import {
   COMPLETE_RECORD_MAX_BYTES,
   DelimitedRecordParser,
@@ -63,6 +68,7 @@ interface PreparedState {
   readonly snapshot: RepositorySnapshot;
   readonly record: StageRecord;
   readonly message: string;
+  readonly hooksPath: string;
   readonly preIndexTreeFingerprint: string;
   readonly preOwnedEntries: ReadonlyMap<string, CommitTreeEntry>;
 }
@@ -184,6 +190,21 @@ async function readLine(runner: GitRunner, root: string, args: readonly string[]
   const line = result.stdout.endsWith("\n") ? result.stdout.slice(0, -1) : result.stdout;
   if (!OBJECT_ID.test(line) || line.includes("\n") || line.includes("\r")) throw new Error("Git returned malformed commit metadata");
   return line;
+}
+
+async function readHooksPath(runner: GitRunner, root: string, signal?: AbortSignal): Promise<string> {
+  const result = await runner.run({
+    cwd: root,
+    args: ["rev-parse", "--path-format=absolute", "--git-path", "hooks"],
+    timeoutMs: remainingDeadlineTimeoutMs(OPERATION_TIMEOUT_MS.read),
+    maxOutputBytes: MUTATION_OUTPUT_LIMIT,
+  }, signal);
+  if (!completeRead(result) || !result.stdout.endsWith("\n")) throw new Error("Unable to resolve native hooks");
+  const path = result.stdout.slice(0, -1);
+  if (path.includes("\n") || path.includes("\r") || !absoluteRepositoryPath.safeParse(path).success) {
+    throw new Error("Git returned a malformed hooks path");
+  }
+  return path;
 }
 
 interface CommitTreeProof {
@@ -331,11 +352,13 @@ export async function prepareCommit(
     reject("SESSION_MISMATCH", "Stage record changed while preparing the commit");
   }
   await sessions.assertActiveStage(finalRecord);
+  const hooksPath = await readHooksPath(runner, finalBefore.root, signal);
 
   const prepared = Object.freeze({ stageId: record.stageId });
   preparedStates.set(prepared, {
     snapshot: Object.freeze({ ...finalBefore }), record: Object.freeze({ ...record, ownedPaths: Object.freeze([...record.ownedPaths]) }),
     message: input.message,
+    hooksPath,
     preIndexTreeFingerprint: preIndex.stageZeroTreeFingerprint,
     preOwnedEntries,
   });
@@ -353,16 +376,25 @@ export async function executePreparedCommit(
   preparedStates.delete(prepared);
 
   let command: GitCommandResult | undefined;
+  let wrappers: Awaited<ReturnType<typeof createHookWrappers>> | undefined;
   try {
+    wrappers = await createHookWrappers(state.hooksPath);
     command = await runner.run({
       cwd: state.snapshot.root,
       args: ["commit", "--no-gpg-sign", "--file=-"],
       stdin: state.message,
       timeoutMs: remainingDeadlineTimeoutMs(OPERATION_TIMEOUT_MS.commit),
       maxOutputBytes: MUTATION_OUTPUT_LIMIT,
+      hookExecution: {
+        wrappersDirectory: wrappers.directory,
+        failureConsumer: wrappers.failureConsumer,
+      },
     }, signal);
   } catch {
     command = undefined;
+  } finally {
+    try { await wrappers?.cleanup(); }
+    catch { /* A private wrapper cleanup failure cannot alter the proven Git outcome. */ }
   }
 
   return withReconciliationDeadline(async () => {
@@ -378,6 +410,13 @@ export async function executePreparedCommit(
         });
       }
       if (command !== undefined && ordinaryGitFailure(command)) {
+        const hook = wrappers?.rejectedHook();
+        if (hook !== undefined) {
+          proven<CommitData>({
+            status: "failed", operation: "git_commit", warnings: [],
+            error: { code: "HOOK_FAILED", message: HOOK_FAILED_MESSAGE, details: { hook } },
+          });
+        }
         proven<CommitData>({
           status: "failed", operation: "git_commit", warnings: [],
           error: { code: "GIT_FAILED", message: "Git did not create a commit" },

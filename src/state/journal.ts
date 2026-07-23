@@ -4,13 +4,13 @@ import { lstat, mkdir, open, readdir } from "node:fs/promises";
 import { join } from "node:path";
 import { BridgeRejection, type BridgeResult } from "../domain/result.js";
 import {
-  AtomicJsonDurabilityError, atomicCreateJson, canonicalStringify, readJson,
+  AtomicJsonDurabilityError, atomicCreateJson, atomicWriteJson, canonicalStringify, readJson,
   type AtomicCreateJsonOutcome,
 } from "./atomic-json.js";
 import type { StatePaths } from "./paths.js";
 import {
   sanitizeAndValidateBridgeResult, sanitizePersistentJson, validateOperationRequestRecord,
-  validateOperationResultRecord, validateOperationStartedRecord, validateRepositoryId,
+  migrateLegacyHookFailureRecord, validateOperationResultRecord, validateOperationStartedRecord, validateRepositoryId,
   validateSafeId, type OperationRequestRecord, type OperationResultRecord,
 } from "./records.js";
 
@@ -280,13 +280,31 @@ export class OperationJournal {
   }
 
   private async loadResult(request: OperationRequestRecord): Promise<OperationResultRecord | null> {
-    const value = await readJson(join(this.operationDirectory(request.requestId), "result.json"));
+    const path = join(this.operationDirectory(request.requestId), "result.json");
+    const value = await readJson(path);
     if (value === null) return null;
-    const record = validateOperationResultRecord(value, request.requestId);
+    let record: OperationResultRecord;
+    try {
+      record = validateOperationResultRecord(value, request.requestId);
+    } catch (error) {
+      const migrated = migrateLegacyHookFailureRecord(value, request.requestId);
+      if (migrated === null) throw error;
+      this.assertResultIdentity(migrated, request);
+      await atomicWriteJson(path, migrated);
+      const persisted = await readJson(path);
+      record = validateOperationResultRecord(persisted, request.requestId);
+      if (canonicalStringify(record) !== canonicalStringify(migrated)) {
+        throw new Error(`Legacy result migration could not be verified: ${request.requestId}`);
+      }
+    }
+    this.assertResultIdentity(record, request);
+    return record;
+  }
+
+  private assertResultIdentity(record: OperationResultRecord, request: OperationRequestRecord): void {
     if (record.result.request_id !== request.requestId) throw new TypeError("Persisted result request ID does not match its operation request");
     if (record.result.repository_id !== request.repositoryId) throw new TypeError("Persisted result repository ID does not match its operation request");
     if (record.result.operation !== request.operation) throw new TypeError("Persisted result operation does not match its operation request");
-    return record;
   }
 
   private async loadDurabilityFallback(request: OperationRequestRecord): Promise<OperationResultRecord | null> {

@@ -6,7 +6,13 @@ import {
   gitSwitchCreateInput, originRemoteRef, relativeGitPath,
 } from "../src/domain/inputs.js";
 import { redactDiagnostic } from "../src/domain/redaction.js";
-import { BRIDGE_ERROR_CODES, commitDataSchema, statusDataSchema, switchCreateDataSchema } from "../src/domain/result.js";
+import {
+  BRIDGE_ERROR_CODES,
+  bridgeResultSchema,
+  commitDataSchema,
+  statusDataSchema,
+  switchCreateDataSchema,
+} from "../src/domain/result.js";
 import { TOOL_CATALOG, TOOL_NAMES } from "../src/mcp/tool-catalog.js";
 
 const EXPECTED_TOOL_NAMES = [
@@ -235,6 +241,22 @@ test("Git output paths allow legal pathspec-looking names without weakening muta
     hook_changed_paths: [":hook.txt", "dir:name/file.ts"], signing: "disabled_by_policy",
   }).success, true);
   assert.ok(BRIDGE_ERROR_CODES.includes("GIT_FAILED"));
+  assert.equal(bridgeResultSchema(commitDataSchema).safeParse({
+    status: "failed", operation: "git_commit", warnings: [],
+    error: {
+      code: "HOOK_FAILED",
+      message: "A native commit hook rejected the commit",
+      details: { hook: "pre-commit" },
+    },
+  }).success, true);
+  assert.equal(bridgeResultSchema(commitDataSchema).safeParse({
+    status: "failed", operation: "git_commit", warnings: [],
+    error: {
+      code: "HOOK_FAILED",
+      message: "A native commit hook rejected the commit",
+      details: { hook: "post-commit" },
+    },
+  }).success, false);
 });
 
 test("every Git-bound path and ref schema rejects ambiguous Unicode while preserving astral text", () => {

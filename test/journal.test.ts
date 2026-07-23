@@ -7,7 +7,7 @@ import { pathToFileURL } from "node:url";
 import { promisify } from "node:util";
 import test from "node:test";
 import { mkdtemp } from "node:fs/promises";
-import { BridgeRejection, type BridgeResult } from "../src/domain/result.js";
+import { BridgeRejection, HOOK_FAILED_MESSAGE, type BridgeResult } from "../src/domain/result.js";
 import { atomicCreateJson, atomicWriteJson, readJson } from "../src/state/atomic-json.js";
 import { AuditLog } from "../src/state/audit.js";
 import {
@@ -357,7 +357,7 @@ test("operation journal preserves structured path and ref values while sanitizin
       remote_url: "git@example.test:owner/private.git",
     },
     error: {
-      code: "HOOK_FAILED", message: "password=message-secret endpoint ssh://user:pass@example.test/private/repo.git",
+      code: "GIT_FAILED", message: "password=message-secret endpoint ssh://user:pass@example.test/private/repo.git",
       details: {
         nested: ["secret=detail-secret"], password: 42,
         authorizationHeader: ["Bearer credential"], refresh_token: { value: "credential" },
@@ -389,6 +389,104 @@ test("operation journal preserves structured path and ref values while sanitizin
   assert.equal(persistedResult.result.error.details.authorizationHeader, "[REDACTED]");
   assert.equal(persistedResult.result.error.details.refresh_token, "[REDACTED]");
   assert.equal(persistedResult.result.error.details.remote_url, "[REMOTE_URL_REDACTED]");
+});
+
+test("operation journal persists only the bounded hook failure contract", async (t) => {
+  const paths = await temporaryState(t);
+  const journal = new OperationJournal(paths, { now: () => timestamp, pid: 123 });
+  const request = {
+    requestId: "hook-failure", operation: "git_commit", repositoryId,
+    input: {
+      repository: "/repo", expected_branch: "main", expected_head: objectId,
+      stage_id: "stage-hook", message: "synthetic-journal-secret",
+    },
+  };
+  await journal.begin(request);
+  await journal.complete(request.requestId, {
+    status: "failed", request_id: request.requestId, repository_id: repositoryId,
+    operation: request.operation, warnings: [],
+    error: { code: "HOOK_FAILED", message: HOOK_FAILED_MESSAGE, details: { hook: "commit-msg" } },
+  });
+
+  const operationDirectory = join(paths.operations, request.requestId);
+  const requestJson = await readFile(join(operationDirectory, "request.json"), "utf8");
+  const resultJson = await readFile(join(operationDirectory, "result.json"), "utf8");
+  const persisted = `${requestJson}\n${resultJson}`;
+  assert.doesNotMatch(persisted, /synthetic-journal-secret|stdout|stderr|exit(?:_| )?(?:code|status)/i);
+  assert.match(resultJson, /"code":"HOOK_FAILED"/);
+  assert.match(resultJson, /"hook":"commit-msg"/);
+  assert.match(resultJson, new RegExp(HOOK_FAILED_MESSAGE));
+});
+
+test("operation journal safely replays a legacy HOOK_FAILED record without its diagnostics", async (t) => {
+  const paths = await temporaryState(t);
+  const journal = new OperationJournal(paths, { now: () => timestamp, pid: 123 });
+  const request = {
+    requestId: "legacy-hook-failure", operation: "git_commit", repositoryId,
+    input: {
+      repository: "/repo", expected_branch: "main", expected_head: objectId,
+      stage_id: "legacy-stage", message: "current request message",
+    },
+  };
+  assert.deepEqual(await journal.begin(request), { kind: "execute" });
+  const legacySecret = "legacy-hook-diagnostic-secret";
+  await writeFile(join(paths.operations, request.requestId, "result.json"), JSON.stringify({
+    requestId: request.requestId,
+    completedAt: timestamp,
+    result: {
+      status: "failed", request_id: request.requestId, repository_id: repositoryId,
+      operation: request.operation, warnings: [],
+      error: {
+        code: "HOOK_FAILED",
+        message: legacySecret,
+        details: { raw: legacySecret, exit_status: 37 },
+      },
+    },
+  }));
+
+  const replay = await journal.get(request.requestId);
+  assert.deepEqual(replay?.result.error, {
+    code: "GIT_FAILED",
+    message: "Git did not create a commit",
+  });
+  assert.doesNotMatch(JSON.stringify(replay), new RegExp(legacySecret));
+  assert.doesNotMatch(JSON.stringify(replay), /exit_status|37/);
+  const migrated = await readFile(join(paths.operations, request.requestId, "result.json"), "utf8");
+  assert.doesNotMatch(migrated, new RegExp(legacySecret));
+  assert.doesNotMatch(migrated, /exit_status|37/);
+  assert.deepEqual(JSON.parse(migrated), replay);
+});
+
+test("operation journal rejects corrupt records that resemble legacy HOOK_FAILED", async (t) => {
+  for (const [name, error] of [
+    ["missing-message", { code: "HOOK_FAILED", details: { raw: "diagnostic" } }],
+    ["unknown-key", { code: "HOOK_FAILED", message: "diagnostic", unexpected: true }],
+  ] as const) {
+    await t.test(name, async (t) => {
+      const paths = await temporaryState(t);
+      const journal = new OperationJournal(paths, { now: () => timestamp, pid: 123 });
+      const request = {
+        requestId: `legacy-corrupt-${name}`, operation: "git_commit", repositoryId,
+        input: {
+          repository: "/repo", expected_branch: "main", expected_head: objectId,
+          stage_id: "legacy-stage", message: "current request message",
+        },
+      };
+      assert.deepEqual(await journal.begin(request), { kind: "execute" });
+      const resultPath = join(paths.operations, request.requestId, "result.json");
+      await writeFile(resultPath, JSON.stringify({
+        requestId: request.requestId,
+        completedAt: timestamp,
+        result: {
+          status: "failed", request_id: request.requestId, repository_id: repositoryId,
+          operation: request.operation, warnings: [], error,
+        },
+      }));
+
+      await assert.rejects(journal.get(request.requestId), /Bridge error|HOOK_FAILED/);
+      assert.match(await readFile(resultPath, "utf8"), /diagnostic|unexpected/);
+    });
+  }
 });
 
 test("operation journal never persists a raw commit message but hashes it for request reuse", async (t) => {

@@ -3,7 +3,14 @@ import { isIP } from "node:net";
 import { validateOriginRemoteRef } from "../domain/origin-ref.js";
 import { isWellFormedGitText } from "../domain/git-text.js";
 import {
-  BRIDGE_ERROR_CODES, validateOperationOutput, type BridgeResult, type OperationStatus,
+  BRIDGE_ERROR_CODES,
+  COMMIT_HOOK_KINDS,
+  HOOK_FAILED_MESSAGE,
+  validateOperationOutput,
+  type BridgeError,
+  type BridgeResult,
+  type CommitHookKind,
+  type OperationStatus,
 } from "../domain/result.js";
 import { redactDiagnostic } from "../domain/redaction.js";
 import {
@@ -224,7 +231,21 @@ export function validateOperationStartedRecord(value: unknown, expectedId?: stri
   return record as unknown as OperationStartedRecord;
 }
 
-function validateBridgeResult(value: unknown, expectedId?: string): BridgeResult<unknown> {
+function isCurrentHookFailure(error: UnknownRecord): boolean {
+  const details = error.details;
+  return error.message === HOOK_FAILED_MESSAGE
+    && details !== null && typeof details === "object" && !Array.isArray(details)
+    && Object.getPrototypeOf(details) === Object.prototype
+    && Object.keys(details as Record<string, unknown>).length === 1
+    && typeof (details as Record<string, unknown>).hook === "string"
+    && COMMIT_HOOK_KINDS.includes((details as Record<string, unknown>).hook as CommitHookKind);
+}
+
+function validateBridgeResult(
+  value: unknown,
+  expectedId?: string,
+  allowLegacyHookFailure = false,
+): BridgeResult<unknown> {
   const result = strictRecord(value, ["status", "operation", "warnings"], ["request_id", "repository_id", "observed_before", "observed_after", "data", "error"], "Bridge result");
   if (typeof result.status !== "string" || !statuses.has(result.status as OperationStatus)) throw new TypeError("Bridge result status is invalid");
   validateOperation(result.operation);
@@ -245,6 +266,14 @@ function validateBridgeResult(value: unknown, expectedId?: string): BridgeResult
     if (typeof error.code !== "string" || !errorCodes.has(error.code)) throw new TypeError("Bridge error code is invalid");
     if (typeof error.message !== "string") throw new TypeError("Bridge error message is invalid");
     if (error.details !== undefined) validateJsonObject(error.details, "Bridge error details");
+    if (error.code === "HOOK_FAILED" && !allowLegacyHookFailure) {
+      if (!isCurrentHookFailure(error)) throw new TypeError("HOOK_FAILED contract is invalid");
+      const details = strictRecord(error.details, ["hook"], [], "HOOK_FAILED details");
+      if (typeof details.hook !== "string"
+        || !COMMIT_HOOK_KINDS.includes(details.hook as CommitHookKind)) {
+        throw new TypeError("HOOK_FAILED hook kind is invalid");
+      }
+    }
     canonicalStringify(error.details ?? {});
   }
   const status = result.status as OperationStatus;
@@ -271,6 +300,29 @@ export function validateOperationResultRecord(value: unknown, expectedId?: strin
   if (expectedId !== undefined && requestId !== expectedId) throw new TypeError("Operation result record ID does not match its path");
   validateTimestamp(record.completedAt, "completedAt"); validateBridgeResult(record.result, requestId);
   return record as unknown as OperationResultRecord;
+}
+
+export function migrateLegacyHookFailureRecord(
+  value: unknown,
+  expectedId?: string,
+): OperationResultRecord | null {
+  const record = strictRecord(value, ["requestId", "completedAt", "result"], [], "Operation result record");
+  const requestId = validateSafeId(record.requestId, "Request ID");
+  if (expectedId !== undefined && requestId !== expectedId) {
+    throw new TypeError("Operation result record ID does not match its path");
+  }
+  validateTimestamp(record.completedAt, "completedAt");
+  validateBridgeResult(record.result, requestId, true);
+  const result = record.result as UnknownRecord;
+  const error = result.error as UnknownRecord;
+  if (error.code !== "HOOK_FAILED" || isCurrentHookFailure(error)) return null;
+  return validateOperationResultRecord({
+    ...record,
+    result: {
+      ...result,
+      error: { code: "GIT_FAILED", message: "Git did not create a commit" },
+    },
+  }, requestId);
 }
 
 export function validateRepositoryRecord(value: unknown, expectedId?: string): RepositoryRecord {
@@ -410,6 +462,17 @@ export function sanitizePersistentJson(
 export function sanitizeAndValidateBridgeResult(value: BridgeResult<unknown>, requestId: string): BridgeResult<unknown> {
   const valid = validateBridgeResult(value, requestId);
   const data = valid.data === undefined ? undefined : validateOperationOutput(valid.operation, valid.data);
+  const sanitizedError: BridgeError | undefined = valid.error === undefined
+    ? undefined
+    : valid.error.code === "HOOK_FAILED"
+    ? valid.error
+    : {
+      code: valid.error.code,
+      message: sanitizeContextualString(valid.error.message, "message"),
+      ...(valid.error.details === undefined ? {} : {
+        details: sanitizePersistentJson(valid.error.details, undefined, "diagnostic") as Readonly<Record<string, unknown>>,
+      }),
+    };
   const sanitized: BridgeResult<unknown> = {
     status: valid.status,
     ...(valid.request_id === undefined ? {} : { request_id: valid.request_id }),
@@ -423,15 +486,7 @@ export function sanitizeAndValidateBridgeResult(value: BridgeResult<unknown>, re
     }),
     ...(data === undefined ? {} : { data }),
     warnings: valid.warnings.map((warning) => sanitizeContextualString(warning, "warning")),
-    ...(valid.error === undefined ? {} : {
-      error: {
-        code: valid.error.code,
-        message: sanitizeContextualString(valid.error.message, "message"),
-        ...(valid.error.details === undefined ? {} : {
-          details: sanitizePersistentJson(valid.error.details, undefined, "diagnostic") as Readonly<Record<string, unknown>>,
-        }),
-      },
-    }),
+    ...(sanitizedError === undefined ? {} : { error: sanitizedError }),
   };
   return validateBridgeResult(sanitized, requestId);
 }

@@ -1,4 +1,5 @@
 import { spawn } from "node:child_process";
+import type { Readable } from "node:stream";
 import { StringDecoder } from "node:string_decoder";
 import { deadlineSignal, isOperationDeadlineExceeded, remainingDeadlineTimeoutMs } from "../deadline.js";
 import { OPERATION_TIMEOUT_MS } from "../product.js";
@@ -13,6 +14,11 @@ export interface GitCommand {
   readonly stdin?: string;
   /** Internal streaming hook. When present, stdout is drained here instead of retained. */
   readonly stdoutConsumer?: (chunk: Buffer) => void;
+  /** Internal native-hook wrapper binding. The original hook child never inherits fd 3. */
+  readonly hookExecution?: {
+    readonly wrappersDirectory: string;
+    readonly failureConsumer: (chunk: Buffer) => void;
+  };
 }
 
 export interface GitStreamingCommand extends Omit<GitCommand, "maxOutputBytes" | "stdoutConsumer"> {
@@ -124,11 +130,21 @@ export class GitRunner {
     }
     const child = spawn(this.executablePath, command.args, {
       cwd: command.cwd,
-      env: this.environment,
+      env: command.hookExecution === undefined
+        ? this.environment
+        : {
+          ...this.environment,
+          GIT_CONFIG_COUNT: "1",
+          GIT_CONFIG_KEY_0: "core.hooksPath",
+          GIT_CONFIG_VALUE_0: command.hookExecution.wrappersDirectory,
+        },
       shell: false,
       detached: process.platform !== "win32",
-      stdio: ["pipe", "pipe", "pipe"],
+      stdio: command.hookExecution === undefined
+        ? ["pipe", "pipe", "pipe"]
+        : ["pipe", "pipe", "pipe", "pipe"],
     });
+    const hookFailure = command.hookExecution === undefined ? null : child.stdio[3] as Readable | null;
 
     let consumerError: Error | undefined;
     let failConsumer = (error: unknown): void => {
@@ -143,6 +159,10 @@ export class GitRunner {
       catch (error) { failConsumer(error); }
     });
     child.stderr.on("data", (chunk: Buffer) => stderr.append(chunk));
+    hookFailure?.on("data", (chunk: Buffer) => {
+      try { command.hookExecution?.failureConsumer(chunk); }
+      catch { /* A classification-channel failure cannot alter the Git operation. */ }
+    });
     child.stdin.on("error", () => undefined);
     child.stdin.end(command.stdin);
 
@@ -245,6 +265,7 @@ export class GitRunner {
           child.stdin.destroy();
           child.stdout.destroy();
           child.stderr.destroy();
+          hookFailure?.destroy();
           child.unref();
           childClosed = true;
         }
