@@ -124,7 +124,7 @@ export const TOOL_CATALOG = {
   },
   git_commit: {
     title: title("Commit staged changes"),
-    description: "Operation: Commit the exact index owned by one stage_id with native hooks and signing disabled. Returns: request_id, repository_id, commit and tree object IDs, hook_changed_paths, and signing policy. Defaults: all inputs are required, native hooks run, and signing stays disabled. Excludes: amend, arbitrary index content, implicit staging, push, and hook bypass.",
+    description: "Operation: Commit the exact index owned by one stage_id with native hooks and signing disabled. Returns: request_id, repository_id, commit and tree object IDs, hook_changed_paths, and signing policy; a rejected pre-commit or commit-msg hook returns HOOK_FAILED with only its allowlisted hook kind. Defaults: all inputs are required, native hooks run, and signing stays disabled. Excludes: raw hook output or exit status, amend, arbitrary index content, implicit staging, push, and hook bypass.",
     inputSchema: gitCommitInput,
     outputSchema: bridgeResultSchema(commitDataSchema),
     annotations: mutationAnnotations,

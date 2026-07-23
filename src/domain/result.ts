@@ -27,11 +27,23 @@ export const BRIDGE_ERROR_CODES = [
 
 export type BridgeErrorCode = (typeof BRIDGE_ERROR_CODES)[number];
 
-export interface BridgeError {
-  code: BridgeErrorCode;
+export const COMMIT_HOOK_KINDS = ["pre-commit", "commit-msg"] as const;
+export type CommitHookKind = (typeof COMMIT_HOOK_KINDS)[number];
+export const HOOK_FAILED_MESSAGE = "A native commit hook rejected the commit";
+
+interface GeneralBridgeError {
+  code: Exclude<BridgeErrorCode, "HOOK_FAILED">;
   message: string;
   details?: Readonly<Record<string, unknown>>;
 }
+
+interface HookFailedError {
+  code: "HOOK_FAILED";
+  message: typeof HOOK_FAILED_MESSAGE;
+  details: Readonly<{ hook: CommitHookKind }>;
+}
+
+export type BridgeError = GeneralBridgeError | HookFailedError;
 
 /** Internal control-flow error that later layers classify into bridge results. */
 export class BridgeRejection extends Error {
@@ -59,11 +71,21 @@ export interface BridgeResult<T> {
 
 const operationStatusSchema = z.enum(["succeeded", "failed", "conflicted", "rejected", "indeterminate"]);
 const observationSchema = z.record(z.string(), z.unknown());
-const bridgeErrorSchema = z.strictObject({
-  code: z.enum(BRIDGE_ERROR_CODES),
-  message: z.string(),
-  details: observationSchema.optional(),
-});
+const nonHookErrorCodes = BRIDGE_ERROR_CODES.filter(
+  (code): code is Exclude<BridgeErrorCode, "HOOK_FAILED"> => code !== "HOOK_FAILED",
+);
+const bridgeErrorSchema = z.discriminatedUnion("code", [
+  z.strictObject({
+    code: z.literal("HOOK_FAILED"),
+    message: z.literal(HOOK_FAILED_MESSAGE),
+    details: z.strictObject({ hook: z.enum(COMMIT_HOOK_KINDS) }),
+  }),
+  z.strictObject({
+    code: z.enum(nonHookErrorCodes),
+    message: z.string(),
+    details: observationSchema.optional(),
+  }),
+]);
 
 export function bridgeResultSchema<T extends z.ZodType>(dataSchema: T) {
   return z.strictObject({

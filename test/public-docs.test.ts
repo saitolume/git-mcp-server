@@ -79,6 +79,18 @@ test("public documentation provides the published user contract", async () => {
   }
   assert.deepEqual(documentedTools(englishReadme), expectedTools);
   assert.deepEqual(documentedTools(japaneseReadme), expectedTools);
+  for (const readme of [englishReadme, japaneseReadme]) {
+    for (const required of [
+      "HOOK_FAILED",
+      "error.details.hook",
+      "pre-commit",
+      "commit-msg",
+      "stdout",
+      "stderr",
+      "stage session",
+    ]) assert.match(readme, new RegExp(escapeRegExp(required)));
+    assert.match(readme, /exit\s+status/);
+  }
   assert.match(security, /latest commit on `main`/i);
   assert.match(security, /Private Vulnerability Reporting/);
   assert.match(architecture, /```mermaid[\s\S]*stdio MCP[\s\S]*native Git[\s\S]*durable journal/);

@@ -65,7 +65,7 @@ MCP client の working directory は未定義の場合があるため、checkout
 | `git_add` | 宣言した paths を stage するか、declared conflict paths を resolved にする。 |
 | `git_restore_staged` | stage session が所有する宣言済み paths を destructive に unstage する。 |
 | `git_restore_worktree` | worktree snapshot guard 後に宣言済み paths を destructive に restore する。 |
-| `git_commit` | supplied message で exact active stage session を commit する。 |
+| `git_commit` | supplied message で exact active stage session を commit する。native `pre-commit` / `commit-msg` の拒否は redacted な `HOOK_FAILED` を返す。 |
 | `git_fetch` | `origin` を fetch し、observed remote refs を fetch session に記録する。 |
 | `git_merge` | expected fetched `origin` tracking ref を merge するか、conflict session を返す。 |
 | `git_merge_continue` | resolved paths が staged された後に declared merge session を完了する。 |
@@ -94,6 +94,18 @@ branch を受け付けるのは `git_switch_create` だけで、厳密に detach
 enabled であり repository-controlled code を実行することがあります。commits は
 `--no-gpg-sign` を使います。server は hooks を bypass しません。destructive restore、
 merge-abort、merge、push は承認前に確認してください。
+
+server は、同じ OS user として動く意図的に悪意のある hooks に対する isolation
+boundary ではありません。hook failure redaction は trusted repositories のための
+bounded result contract であり、敵対的な hook code の sandbox ではありません。
+
+native `pre-commit` または `commit-msg` hook が commit を拒否した場合、
+`git_commit` は `status: "failed"` と `error.code: "HOOK_FAILED"` を返します。
+固定 error が含む hook 情報は `error.details.hook` のみで、値は `pre-commit` または
+`commit-msg` に allowlist されています。hook の raw stdout / stderr、exit status、
+file content は operation result に返さず、永続化もしません。commit HEAD は変わらず、
+stage session は修正後の retry に再利用できます。hook が拒否前に index を変更した場合は、
+既存の index guard が exact stage-session state を復元するまで retry を拒否します。
 
 ## State directories
 

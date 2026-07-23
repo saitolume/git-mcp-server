@@ -66,7 +66,7 @@ an MCP client's working directory may be undefined.
 | `git_add` | Stage declared paths, or mark declared conflict paths resolved. |
 | `git_restore_staged` | Destructively unstage declared paths owned by a stage session. |
 | `git_restore_worktree` | Destructively restore declared paths after a worktree snapshot guard. |
-| `git_commit` | Commit the exact active stage session with the supplied message. |
+| `git_commit` | Commit the exact active stage session with the supplied message; native `pre-commit` and `commit-msg` rejection returns a redacted `HOOK_FAILED`. |
 | `git_fetch` | Fetch `origin` and record observed remote refs in a fetch session. |
 | `git_merge` | Merge an expected fetched `origin` tracking ref, or return a conflict session. |
 | `git_merge_continue` | Complete a declared merge session after resolved paths are staged. |
@@ -96,6 +96,20 @@ and mutations require expected branch and HEAD preconditions. Only
 enabled and may run repository-controlled code. Commits use `--no-gpg-sign`;
 the server does not bypass hooks. Review destructive restore, merge-abort,
 merge, and push operations before approving them.
+
+The server is not an isolation boundary for intentionally malicious hooks
+running as the same operating-system user. Hook-failure redaction is a bounded
+result contract for trusted repositories, not a sandbox for hostile hook code.
+
+When a native `pre-commit` or `commit-msg` hook rejects a commit,
+`git_commit` returns `status: "failed"` with `error.code: "HOOK_FAILED"`.
+The fixed error contains only `error.details.hook`, whose value is allowlisted
+to `pre-commit` or `commit-msg`. Raw hook stdout and stderr, the hook exit
+status, and file contents are not returned or persisted in the operation
+result. The commit HEAD remains unchanged and the stage session remains
+available for a corrected retry. If the hook changed the index before
+rejecting the commit, the existing index guard prevents retry until the caller
+restores an exact stage-session state.
 
 ## State directories
 

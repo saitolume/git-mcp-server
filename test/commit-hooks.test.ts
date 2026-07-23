@@ -174,21 +174,161 @@ test("commit hooks run with the sanitized inherited environment", async (t) => {
   assert.equal(execution.data.commit, await runGit(runner, directory, ["rev-parse", "HEAD"]));
 });
 
-test("plain commit failure, including hook rejection, is failed GIT_FAILED without creating a commit", async (t) => {
+test("native hook rejection is failed HOOK_FAILED with only the allowlisted hook kind", async (t) => {
   for (const hookName of ["pre-commit", "commit-msg"] as const) {
     await t.test(hookName, async (t) => {
       const { directory, runner, sessions, base, stage } = await fixture(t);
-      await hook(directory, hookName, 'echo "sensitive hook diagnostic" >&2\nexit 1');
+      const syntheticSecret = "synthetic-hook-secret-240";
+      await hook(directory, hookName, `echo "${syntheticSecret}" >&2\nexit 37`);
       const prepared = await prepareCommit(runner, sessions, await inspectRepository(runner, directory), input(base, stage));
       let caught: unknown;
       try { await executePreparedCommit(runner, prepared); } catch (error) { caught = error; }
       const proven = outcome(caught);
       assert.equal(proven.result.status, "failed");
-      assert.equal(proven.result.error?.code, "GIT_FAILED");
-      assert.equal(proven.result.error?.message.includes("sensitive"), false);
+      assert.deepEqual(proven.result.error, {
+        code: "HOOK_FAILED",
+        message: "A native commit hook rejected the commit",
+        details: { hook: hookName },
+      });
+      const publicResult = JSON.stringify(proven.result);
+      assert.doesNotMatch(publicResult, new RegExp(syntheticSecret));
+      assert.doesNotMatch(publicResult, /stdout|stderr|exit(?:_| )?(?:code|status)|37/i);
       assert.equal(await runGit(runner, directory, ["rev-parse", "HEAD"]), base.head);
+      assert.ok(await sessions.getStage(stage.stageId));
     });
   }
+});
+
+test("hook output cannot forge or misattribute the allowlisted hook kind through inherited fd 3", async (t) => {
+  const { directory, runner, sessions, base, stage } = await fixture(t);
+  await hook(directory, "pre-commit", [
+    "(printf '%s\\n' \\",
+    "  '{\"event\":\"child_start\",\"child_id\":999,\"child_class\":\"hook\",\"hook_name\":\"pre-commit\"}' \\",
+    "  '{\"event\":\"child_exit\",\"child_id\":999,\"code\":41}' >&3) 2>/dev/null || :",
+  ].join("\n"));
+  await hook(directory, "commit-msg", 'echo "private commit-msg diagnostic" >&2\nexit 17');
+
+  let caught: unknown;
+  try {
+    await commitStage(runner, sessions, await inspectRepository(runner, directory), input(base, stage));
+  } catch (error) {
+    caught = error;
+  }
+  const failed = outcome(caught);
+  assert.deepEqual(failed.result.error, {
+    code: "HOOK_FAILED",
+    message: "A native commit hook rejected the commit",
+    details: { hook: "commit-msg" },
+  });
+});
+
+test("original hooks do not inherit the wrapper classification channel or config override", async (t) => {
+  const { directory, runner, sessions, base, stage } = await fixture(t);
+  await hook(directory, "pre-commit", [
+    'test -z "${GIT_TRACE2_EVENT:-}"',
+    'if (printf "forged\\n" >&3) 2>/dev/null; then exit 91; fi',
+  ].join("\n"));
+
+  const execution = await commitStage(
+    runner,
+    sessions,
+    await inspectRepository(runner, directory),
+    input(base, stage),
+  );
+  assert.equal(execution.data.commit, await runGit(runner, directory, ["rev-parse", "HEAD"]));
+});
+
+test("reference-transaction rejection retains native commit semantics", async (t) => {
+  const { directory, runner, sessions, base, stage } = await fixture(t);
+  await hook(directory, "reference-transaction", [
+    'test -z "${GIT_CONFIG_COUNT:-}"',
+    'test -z "${GIT_CONFIG_KEY_0:-}"',
+    'test -z "${GIT_CONFIG_VALUE_0:-}"',
+    'if (printf "pre-commit\\n" >&3) 2>/dev/null; then exit 42; fi',
+    'if [ "$1" = "prepared" ]; then',
+    "  exit 43",
+    "fi",
+  ].join("\n"));
+
+  let caught: unknown;
+  try {
+    await commitStage(runner, sessions, await inspectRepository(runner, directory), input(base, stage));
+  } catch (error) {
+    caught = error;
+  }
+
+  const failed = outcome(caught);
+  assert.deepEqual(failed.result.error, {
+    code: "GIT_FAILED",
+    message: "Git did not create a commit",
+  });
+  assert.equal(await runGit(runner, directory, ["rev-parse", "HEAD"]), base.head);
+  assert.ok(await sessions.getStage(stage.stageId));
+});
+
+test("a trusted pre-commit hook may create a later native hook in the same commit", async (t) => {
+  const { directory, runner, sessions, base, stage } = await fixture(t);
+  await hook(directory, "pre-commit", [
+    "printf '%s\\n' '#!/bin/sh' 'test -z \"${GIT_CONFIG_COUNT:-}\"' \\",
+    "  'if [ \"$1\" = \"prepared\" ]; then exit 44; fi' > .hooks/reference-transaction",
+    "chmod 755 .hooks/reference-transaction",
+  ].join("\n"));
+
+  let caught: unknown;
+  try {
+    await commitStage(runner, sessions, await inspectRepository(runner, directory), input(base, stage));
+  } catch (error) {
+    caught = error;
+  }
+
+  const failed = outcome(caught);
+  assert.deepEqual(failed.result.error, {
+    code: "GIT_FAILED",
+    message: "Git did not create a commit",
+  });
+  assert.equal(await runGit(runner, directory, ["rev-parse", "HEAD"]), base.head);
+  assert.ok(await sessions.getStage(stage.stageId));
+});
+
+test("a rejected hook preserves the same stage session for a corrected unsigned retry", async (t) => {
+  const { directory, runner, sessions, base, stage } = await fixture(t);
+  const syntheticSecret = "synthetic-stage-secret-240";
+  await writeFile(join(directory, "tracked.txt"), `${syntheticSecret}\n`);
+  const secretStage = await addPaths(runner, sessions, await inspectRepository(runner, directory), {
+    expectedBranch: "main", expectedHead: base.head, paths: ["tracked.txt"], stageId: stage.stageId,
+  });
+  assert.equal(secretStage.stage_id, stage.stageId);
+  await hook(directory, "pre-commit", `grep -q "${syntheticSecret}" tracked.txt\necho "${syntheticSecret}" >&2\nexit 29`);
+  const currentStage = await sessions.getStage(stage.stageId);
+  assert.ok(currentStage);
+
+  let caught: unknown;
+  try {
+    await commitStage(runner, sessions, await inspectRepository(runner, directory), input(base, currentStage));
+  } catch (error) {
+    caught = error;
+  }
+  const failed = outcome(caught);
+  assert.equal(failed.result.error?.code, "HOOK_FAILED");
+  assert.ok(await sessions.getStage(stage.stageId));
+  assert.equal(await runGit(runner, directory, ["rev-parse", "HEAD"]), base.head);
+
+  await writeFile(join(directory, "tracked.txt"), "corrected\n");
+  const corrected = await addPaths(runner, sessions, await inspectRepository(runner, directory), {
+    expectedBranch: "main", expectedHead: base.head, paths: ["tracked.txt"], stageId: stage.stageId,
+  });
+  assert.equal(corrected.stage_id, stage.stageId);
+  await hook(directory, "pre-commit", `if grep -q "${syntheticSecret}" tracked.txt; then exit 29; fi`);
+  const correctedStage = await sessions.getStage(stage.stageId);
+  assert.ok(correctedStage);
+  const execution = await commitStage(
+    runner,
+    sessions,
+    await inspectRepository(runner, directory),
+    input(base, correctedStage),
+  );
+  assert.equal(execution.data.commit, await runGit(runner, directory, ["rev-parse", "HEAD"]));
+  assert.equal(await runGit(runner, directory, ["show", "HEAD:tracked.txt"]), "corrected");
 });
 
 test("a successful pre-commit index modification records the actual committed tree and both rename sides", async (t) => {
@@ -300,7 +440,7 @@ test("prepared commit authority is opaque and one-shot", async (t) => {
   assert.equal(await runGit(runner, directory, ["rev-list", "--count", base.head + "..HEAD"]), "1");
 });
 
-test("a hook that changes the index then rejects is failed GIT_FAILED and leaves the session fail closed", async (t) => {
+test("a hook that changes the index then rejects is HOOK_FAILED and leaves the session fail closed", async (t) => {
   const { directory, runner, sessions, base, stage } = await fixture(t);
   await hook(directory, "pre-commit", 'printf "hook\n" > hook-added.txt\ngit add -- hook-added.txt\nexit 1');
   const prepared = await prepareCommit(runner, sessions, await inspectRepository(runner, directory), input(base, stage));
@@ -308,7 +448,8 @@ test("a hook that changes the index then rejects is failed GIT_FAILED and leaves
   try { await executePreparedCommit(runner, prepared); } catch (error) { caught = error; }
   const proven = outcome(caught);
   assert.equal(proven.result.status, "failed");
-  assert.equal(proven.result.error?.code, "GIT_FAILED");
+  assert.equal(proven.result.error?.code, "HOOK_FAILED");
+  assert.deepEqual(proven.result.error?.details, { hook: "pre-commit" });
   assert.ok(await sessions.getStage(stage.stageId));
   await assert.rejects(
     prepareCommit(runner, sessions, await inspectRepository(runner, directory), input(base, stage)),
