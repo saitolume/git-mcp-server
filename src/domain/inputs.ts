@@ -76,6 +76,19 @@ export const gitSwitchCreateInput = z.strictObject({
     .describe("New local branch name to create from the exact expected HEAD; existing or invalid refs are rejected."),
 });
 
+const attachBranchName = gitTransportText.min(1)
+  .refine((value) => value !== "HEAD" && !value.startsWith("refs/"), "branch must be a local branch name, not a ref expression")
+  .describe("Existing local branch name to attach; HEAD, refs/* names, arbitrary ref expressions, and invalid Git branch names are forbidden.");
+
+export const gitSwitchAttachInput = z.strictObject({
+  ...mutationBase,
+  expected_branch: z.literal(null)
+    .describe("Required null literal proving the caller expects the current worktree to be detached."),
+  branch: attachBranchName,
+  expected_branch_head: objectId
+    .describe("Exact full object ID expected at the existing local branch before attachment."),
+});
+
 export const gitAddInput = z.strictObject({
   ...mutationBase,
   paths: mutationPaths.describe("Explicit literal paths to stage; every path must satisfy the selected stage or merge session policy."),
@@ -140,6 +153,7 @@ export const gitOperationGetInput = z.strictObject({
 export type GitStatusInput = z.infer<typeof gitStatusInput>;
 export type GitDiffInput = z.infer<typeof gitDiffInput>;
 export type GitSwitchCreateInput = z.infer<typeof gitSwitchCreateInput>;
+export type GitSwitchAttachInput = z.infer<typeof gitSwitchAttachInput>;
 export type GitAddInput = z.infer<typeof gitAddInput>;
 export type GitRestoreStagedInput = z.infer<typeof gitRestoreStagedInput>;
 export type GitRestoreWorktreeInput = z.infer<typeof gitRestoreWorktreeInput>;

@@ -16,7 +16,7 @@ import {
 import { TOOL_CATALOG, TOOL_NAMES } from "../src/mcp/tool-catalog.js";
 
 const EXPECTED_TOOL_NAMES = [
-  "git_status", "git_diff", "git_switch_create", "git_add",
+  "git_status", "git_diff", "git_switch_create", "git_switch_attach", "git_add",
   "git_restore_staged", "git_restore_worktree", "git_commit", "git_fetch",
   "git_merge", "git_merge_continue", "git_merge_abort", "git_push",
   "git_operation_get",
@@ -29,7 +29,7 @@ const expectedCatalog = TOOL_CATALOG as unknown as Record<ExpectedToolName, {
   outputSchema: { safeParse: unknown };
 }>;
 
-test("the catalog contains the approved 13 Git tools", () => {
+test("the catalog contains the approved 14 Git tools", () => {
   assert.deepEqual(TOOL_NAMES, EXPECTED_TOOL_NAMES);
 });
 
@@ -49,6 +49,7 @@ const DESCRIPTION_FRAGMENTS: Readonly<Record<ExpectedToolName, readonly string[]
   git_status: ["repository_id", "worktree_snapshot_id", "read-only"],
   git_diff: ["max_bytes", "1000000", "omitted paths", "read-only"],
   git_switch_create: ["exact expected HEAD", "expected_branch", "null", "detached HEAD", "existing branch", "force"],
+  git_switch_attach: ["existing local branch", "expected_branch_head", "detached HEAD", "same", "other worktree", "remote", "--no-guess"],
   git_add: ["stage_id", "merge_session_id", "directories", "globs"],
   git_restore_staged: ["stage_id", "remaining", "worktree", "unowned"],
   git_restore_worktree: ["current index", "snapshot guard", "worktree_snapshot_id", "untracked"],
@@ -226,6 +227,32 @@ test("only switch create accepts null as the exact detached HEAD branch precondi
 
   const schema = z.toJSONSchema(TOOL_CATALOG.git_switch_create.inputSchema) as JsonSchemaNode;
   assert.match(schema.properties?.expected_branch?.description ?? "", /null.*detached HEAD|detached HEAD.*null/i);
+});
+
+test("switch attach publishes an exact detached and existing-branch schema", () => {
+  const catalog = TOOL_CATALOG as unknown as Record<string, { inputSchema?: z.ZodType }>;
+  const schema = catalog.git_switch_attach?.inputSchema;
+  assert.ok(schema, "git_switch_attach input schema must be registered");
+  const valid = {
+    repository: "/repo",
+    request_id: "018f47d2-7b2a-7d75-b9dd-5ea8abca0093",
+    expected_branch: null,
+    expected_head: "a".repeat(40),
+    branch: "claimed/topic",
+    expected_branch_head: "a".repeat(40),
+  };
+  assert.equal(schema.safeParse(valid).success, true);
+  for (const invalid of [
+    { ...valid, expected_branch: "main" },
+    { ...valid, expected_head: "a".repeat(39) },
+    { ...valid, expected_branch_head: "a".repeat(39) },
+    { ...valid, branch: "refs/heads/claimed/topic" },
+    { ...valid, extra: true },
+  ]) assert.equal(schema.safeParse(invalid).success, false);
+
+  const generated = z.toJSONSchema(schema) as JsonSchemaNode;
+  assert.equal(generated.properties?.expected_branch?.const, null);
+  assert.match(generated.properties?.expected_branch_head?.description ?? "", /exact.*local branch|local branch.*exact/i);
 });
 
 test("Git output paths allow legal pathspec-looking names without weakening mutation inputs", () => {

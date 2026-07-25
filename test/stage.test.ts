@@ -7,6 +7,7 @@ import test from "node:test";
 import { relativeGitPath } from "../src/domain/inputs.js";
 import { BridgeRejection } from "../src/domain/result.js";
 import {
+  executePreparedSwitchAttach, prepareSwitchAttach, preparedSwitchAttachObservation, switchAttach,
   executePreparedSwitchCreate, prepareSwitchCreate, preparedSwitchCreateObservation, switchCreate,
 } from "../src/git/branch.js";
 import { prepareCommit } from "../src/git/commit.js";
@@ -77,6 +78,51 @@ class RejectAfterMutationRunner extends TrackingRunner {
       throw new Error("runner rejected after the Git effect");
     }
     if (this.rejected) this.postMutationSignals.push(signal);
+    return super.run(command, signal);
+  }
+}
+
+class DeleteTargetBeforeSwitchRunner extends TrackingRunner {
+  private changed = false;
+
+  constructor(
+    executable: string,
+    environment: NodeJS.ProcessEnv,
+    private readonly branch: string,
+    private readonly head: string,
+  ) {
+    super(executable, environment);
+  }
+
+  override async run(command: GitCommand, signal?: AbortSignal): Promise<GitCommandResult> {
+    if (!this.changed && (JSON.stringify(command.args) === JSON.stringify(["switch", this.branch])
+      || JSON.stringify(command.args) === JSON.stringify(["switch", "--no-guess", this.branch]))) {
+      this.changed = true;
+      await GitRunner.prototype.run.call(this, {
+        ...command, args: ["update-ref", "-d", `refs/heads/${this.branch}`],
+      }, signal);
+      await GitRunner.prototype.run.call(this, {
+        ...command, args: ["update-ref", `refs/remotes/origin/${this.branch}`, this.head],
+      }, signal);
+    }
+    return super.run(command, signal);
+  }
+}
+
+class WorktreeListOverrideRunner extends TrackingRunner {
+  constructor(
+    executable: string,
+    environment: NodeJS.ProcessEnv,
+    private readonly worktreeList: GitCommandResult,
+  ) {
+    super(executable, environment);
+  }
+
+  override async run(command: GitCommand, signal?: AbortSignal): Promise<GitCommandResult> {
+    if (JSON.stringify(command.args) === JSON.stringify(["worktree", "list", "--porcelain", "-z"])) {
+      this.commands.push(command);
+      return this.worktreeList;
+    }
     return super.run(command, signal);
   }
 }
@@ -409,6 +455,217 @@ test("switch create rejects invalid, existing, dirty, and untracked states befor
         switchCreate(runner, sessions, snapshot, { expectedBranch: "main", expectedHead: snapshot.head, branch }),
         rejection(scenario === "invalid" || scenario === "existing" ? "INVALID_INPUT" : "UNSUPPORTED_REPOSITORY_STATE"),
       );
+      assert.equal(runner.commands.some(({ args }) => args[0] === "switch"), false);
+    });
+  }
+});
+
+test("switch attach checks out only an existing same-HEAD branch from a clean detached worktree", async (t) => {
+  const { directory, runner, sessions } = await fixture(t);
+  await runGit(runner, directory, ["branch", "claimed/topic"]);
+  await runGit(runner, directory, ["checkout", "--detach"]);
+  const detached = await inspectRepository(runner, directory);
+  runner.commands.length = 0;
+
+  const result = await switchAttach(runner, sessions, detached, {
+    expectedBranch: null,
+    expectedHead: detached.head,
+    branch: "claimed/topic",
+    expectedBranchHead: detached.head,
+  });
+
+  assert.deepEqual(result, { branch: "claimed/topic", head: detached.head });
+  const mutation = runner.commands.filter(({ args }) => args[0] === "switch");
+  assert.deepEqual(mutation.map(({ args }) => args), [["switch", "--no-guess", "claimed/topic"]]);
+  assert.equal(runner.commands.some(({ args }) => args.includes("-c") || args.includes("--force") || args[0] === "reset"), false);
+  const after = await inspectRepository(runner, directory);
+  assert.equal(after.branch, "claimed/topic");
+  assert.equal(after.head, detached.head);
+});
+
+test("switch attach rejects every stale, dirty, active, missing, unequal, or claimed state before switch", async (t) => {
+  const scenarios = [
+    "attached", "head-mismatch", "invalid-target", "missing-target", "target-head-mismatch",
+    "unequal-heads", "dirty", "untracked", "operation", "active-session", "other-worktree",
+  ] as const;
+  for (const scenario of scenarios) {
+    await t.test(scenario, async (t) => {
+      const { directory, runner, sessions, snapshot } = await fixture(t);
+      const branch = scenario === "invalid-target" ? "refs/heads/claimed" : `claimed/${scenario}`;
+      let expectedBranchHead = snapshot.head;
+      if (scenario !== "invalid-target" && scenario !== "missing-target") {
+        await runGit(runner, directory, ["branch", branch]);
+      }
+      if (scenario === "unequal-heads") {
+        await runGit(runner, directory, ["commit", "--allow-empty", "--no-gpg-sign", "-m", "advance current"]);
+      }
+      if (scenario !== "attached") await runGit(runner, directory, ["checkout", "--detach"]);
+      let current = await inspectRepository(runner, directory);
+      let expectedHead = current.head;
+      if (scenario === "head-mismatch") expectedHead = "0".repeat(40);
+      if (scenario === "target-head-mismatch") expectedBranchHead = "0".repeat(40);
+      if (scenario === "dirty") await writeFile(join(directory, "src", "a.ts"), "dirty\n");
+      if (scenario === "untracked") await writeFile(join(directory, "untracked.txt"), "dirty\n");
+      if (scenario === "operation") {
+        await writeFile(join(directory, ".git", "MERGE_HEAD"), current.head);
+        current = await inspectRepository(runner, directory);
+      }
+      if (scenario === "active-session") {
+        await sessions.createStageSession({
+          kind: "stage", stageId: "active-attach", repositoryId: current.repositoryId,
+          branch: "main", baseHead: current.head, initialIndexTree: current.indexTree,
+          currentIndexTree: current.indexTree, ownedPaths: [],
+          createdAt: "2026-07-25T00:00:00.000Z", updatedAt: "2026-07-25T00:00:00.000Z",
+        });
+      }
+      if (scenario === "other-worktree") {
+        const other = `${directory}-other`;
+        t.after(async () => rm(other, { recursive: true, force: true }));
+        await runGit(runner, directory, ["worktree", "add", other, branch]);
+      }
+      runner.commands.length = 0;
+
+      const expectedCode = scenario === "attached" ? "BRANCH_MISMATCH"
+        : scenario === "head-mismatch" || scenario === "target-head-mismatch" || scenario === "unequal-heads"
+          ? "HEAD_MISMATCH"
+          : scenario === "invalid-target" || scenario === "missing-target"
+            ? "INVALID_INPUT"
+            : scenario === "active-session" ? "SESSION_MISMATCH" : "UNSUPPORTED_REPOSITORY_STATE";
+      await assert.rejects(switchAttach(runner, sessions, current, {
+        expectedBranch: null, expectedHead, branch, expectedBranchHead,
+      }), rejection(expectedCode));
+      assert.equal(runner.commands.some(({ args }) => args[0] === "switch"), false);
+      assert.equal((await inspectRepository(runner, directory)).head, current.head);
+    });
+  }
+});
+
+test("switch attach prepare authority is exact, observable, and one-shot", async (t) => {
+  const { directory, runner, sessions } = await fixture(t);
+  await runGit(runner, directory, ["branch", "claimed/phased"]);
+  await runGit(runner, directory, ["checkout", "--detach"]);
+  const detached = await inspectRepository(runner, directory);
+  runner.commands.length = 0;
+
+  const prepared = await prepareSwitchAttach(runner, sessions, detached, {
+    expectedBranch: null,
+    expectedHead: detached.head,
+    branch: "claimed/phased",
+    expectedBranchHead: detached.head,
+  });
+  assert.deepEqual(preparedSwitchAttachObservation(prepared), {
+    branch: null,
+    head: detached.head,
+    index_tree: detached.indexTree,
+    target_branch: "claimed/phased",
+    target_head: detached.head,
+  });
+  assert.deepEqual(await executePreparedSwitchAttach(runner, prepared), {
+    branch: "claimed/phased",
+    head: detached.head,
+  });
+  await assert.rejects(executePreparedSwitchAttach(runner, prepared), rejection("INVALID_INPUT"));
+  await assert.rejects(
+    executePreparedSwitchAttach(runner, Object.freeze({ branch: "forged" })),
+    rejection("INVALID_INPUT"),
+  );
+});
+
+test("switch attach reconciles the exact effect after caller abort or runner rejection", async (t) => {
+  for (const scenario of ["abort", "reject"] as const) {
+    await t.test(scenario, async (t) => {
+      const { directory, sessions } = await fixture(t);
+      const setup = new TrackingRunner(await resolveGitExecutable(), process.env);
+      await runGit(setup, directory, ["branch", `claimed/${scenario}`]);
+      await runGit(setup, directory, ["checkout", "--detach"]);
+      const detached = await inspectRepository(setup, directory);
+      const controller = new AbortController();
+      const runner = scenario === "abort"
+        ? new AbortAfterMutationRunner(
+          await resolveGitExecutable(), process.env, controller,
+          ({ args }) => JSON.stringify(args) === JSON.stringify(["switch", "--no-guess", `claimed/${scenario}`]),
+        )
+        : new RejectAfterMutationRunner(
+          await resolveGitExecutable(), process.env, controller,
+          ({ args }) => JSON.stringify(args) === JSON.stringify(["switch", "--no-guess", `claimed/${scenario}`]),
+        );
+
+      const result = await switchAttach(runner, sessions, detached, {
+        expectedBranch: null,
+        expectedHead: detached.head,
+        branch: `claimed/${scenario}`,
+        expectedBranchHead: detached.head,
+      }, controller.signal);
+
+      assert.deepEqual(result, { branch: `claimed/${scenario}`, head: detached.head });
+      assert.equal(controller.signal.aborted, true);
+      if (runner instanceof RejectAfterMutationRunner) {
+        assert.ok(runner.postMutationSignals.length > 0);
+        assert.equal(runner.postMutationSignals.every((signal) => signal === undefined), true);
+      }
+    });
+  }
+});
+
+test("switch attach never guesses a deleted local branch from a same-name remote-tracking ref", async (t) => {
+  const { directory, sessions } = await fixture(t);
+  const setup = new TrackingRunner(await resolveGitExecutable(), process.env);
+  const branch = "claimed/no-guess";
+  await runGit(setup, directory, ["remote", "add", "origin", "https://example.invalid/repository.git"]);
+  await runGit(setup, directory, ["branch", branch]);
+  await runGit(setup, directory, ["checkout", "--detach"]);
+  const detached = await inspectRepository(setup, directory);
+  const runner = new DeleteTargetBeforeSwitchRunner(
+    await resolveGitExecutable(), process.env, branch, detached.head,
+  );
+
+  await assert.rejects(switchAttach(runner, sessions, detached, {
+    expectedBranch: null,
+    expectedHead: detached.head,
+    branch,
+    expectedBranchHead: detached.head,
+  }), /did not complete successfully/);
+
+  const local = await runner.run({
+    cwd: directory,
+    args: ["show-ref", "--verify", "--quiet", `refs/heads/${branch}`],
+    timeoutMs: 10_000,
+    maxOutputBytes: 32_768,
+  });
+  assert.equal(local.exitCode, 1);
+  assert.ok(runner.commands.some(
+    ({ args }) => JSON.stringify(args) === JSON.stringify(["switch", "--no-guess", branch]),
+  ));
+});
+
+test("switch attach rejects malformed complete worktree ownership proofs before mutation", async (t) => {
+  const malformed = [
+    "worktree /fixture\0HEAD " + "a".repeat(40) + "\0",
+    "worktree /fixture\0HEAD " + "a".repeat(40) + "\0detached\0branch refs/heads/other\0\0",
+    "worktree /fixture\0HEAD invalid\0detached\0\0",
+    "worktree /fixture\0HEAD " + "a".repeat(40) + "\0branch refs/heads/one\0branch refs/heads/two\0\0",
+    "unknown value\0\0",
+  ];
+  for (const [index, stdout] of malformed.entries()) {
+    await t.test(String(index), async (t) => {
+      const { directory, sessions } = await fixture(t);
+      const setup = new TrackingRunner(await resolveGitExecutable(), process.env);
+      const branch = `claimed/malformed-${index}`;
+      await runGit(setup, directory, ["branch", branch]);
+      await runGit(setup, directory, ["checkout", "--detach"]);
+      const detached = await inspectRepository(setup, directory);
+      const runner = new WorktreeListOverrideRunner(
+        await resolveGitExecutable(),
+        process.env,
+        commandResult({ stdout }),
+      );
+
+      await assert.rejects(switchAttach(runner, sessions, detached, {
+        expectedBranch: null,
+        expectedHead: detached.head,
+        branch,
+        expectedBranchHead: detached.head,
+      }), rejection("UNSUPPORTED_REPOSITORY_STATE"));
       assert.equal(runner.commands.some(({ args }) => args[0] === "switch"), false);
     });
   }

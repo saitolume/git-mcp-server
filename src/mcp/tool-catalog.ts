@@ -12,6 +12,7 @@ import {
   gitRestoreStagedInput,
   gitRestoreWorktreeInput,
   gitStatusInput,
+  gitSwitchAttachInput,
   gitSwitchCreateInput,
 } from "../domain/inputs.js";
 import {
@@ -27,12 +28,13 @@ import {
   restoreStagedDataSchema,
   restoreWorktreeDataSchema,
   statusDataSchema,
+  switchAttachDataSchema,
   switchCreateDataSchema,
 } from "../domain/result.js";
 import { PRODUCT } from "../product.js";
 
 export const TOOL_NAMES = [
-  "git_status", "git_diff", "git_switch_create", "git_add",
+  "git_status", "git_diff", "git_switch_create", "git_switch_attach", "git_add",
   "git_restore_staged", "git_restore_worktree", "git_commit", "git_fetch",
   "git_merge", "git_merge_continue", "git_merge_abort", "git_push",
   "git_operation_get",
@@ -99,6 +101,13 @@ export const TOOL_CATALOG = {
     description: "Operation: Create and switch to one new branch from the exact expected_branch and exact expected HEAD. Returns: request_id, repository_id, the created branch, and unchanged head; no session identifier. Defaults: a string expected_branch requires that attached branch, while null requires detached HEAD. Excludes: existing branch checkout, force or reset, branch or HEAD mismatch, dirty or untracked state, and remote access.",
     inputSchema: gitSwitchCreateInput,
     outputSchema: bridgeResultSchema(switchCreateDataSchema),
+    annotations: mutationAnnotations,
+  },
+  git_switch_attach: {
+    title: title("Attach branch"),
+    description: "Operation: Attach a clean detached worktree to one existing local branch whose expected_branch_head exactly matches the detached HEAD, using native switch --no-guess. Returns: request_id, repository_id, the attached branch, and unchanged head; no session identifier. Defaults: expected_branch must be null and both current and target HEAD guards must name the same commit. Excludes: branch creation, a target checked out in another worktree, dirty state, arbitrary refs, force or reset, implicit stash, and remote access.",
+    inputSchema: gitSwitchAttachInput,
+    outputSchema: bridgeResultSchema(switchAttachDataSchema),
     annotations: mutationAnnotations,
   },
   git_add: {

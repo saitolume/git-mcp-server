@@ -97,7 +97,7 @@ export function withDeadline<T>(
 
 export function operationTimeoutMs(operation: string): number {
   if (["git_status", "git_diff", "git_operation_get"].includes(operation)) return OPERATION_TIMEOUT_MS.read;
-  if (["git_add", "git_restore_staged", "git_restore_worktree", "git_switch_create"].includes(operation)) {
+  if (["git_add", "git_restore_staged", "git_restore_worktree", "git_switch_create", "git_switch_attach"].includes(operation)) {
     return OPERATION_TIMEOUT_MS.stage;
   }
   if (operation === "git_commit") return OPERATION_TIMEOUT_MS.commit;

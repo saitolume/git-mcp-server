@@ -18,6 +18,7 @@ const expectedTools = [
   "git_status",
   "git_diff",
   "git_switch_create",
+  "git_switch_attach",
   "git_add",
   "git_restore_staged",
   "git_restore_worktree",
@@ -71,6 +72,9 @@ test("public documentation provides the published user contract", async () => {
       "pnpm@11.15.1",
       "22.13",
       "Private Vulnerability Reporting",
+      "git_switch_attach",
+      "expected_branch_head",
+      "restart",
     ]) assert.match(readme, new RegExp(escapeRegExp(required)));
     for (const retiredName of [
       ["Agent", "Git", "Bridge"].join(" "),
@@ -94,6 +98,7 @@ test("public documentation provides the published user contract", async () => {
   assert.match(security, /latest commit on `main`/i);
   assert.match(security, /Private Vulnerability Reporting/);
   assert.match(architecture, /```mermaid[\s\S]*stdio MCP[\s\S]*native Git[\s\S]*durable journal/);
+  assert.match(architecture, /git_switch_attach[\s\S]*expected_branch_head[\s\S]*git switch --no-guess <branch>/);
 });
 
 test("relative links in public documentation resolve within the repository", async () => {

@@ -142,6 +142,45 @@ test("bridge replays detached switch create without a second Git mutation", asyn
   ).length, 1);
 });
 
+test("bridge durably replays exact branch attachment evidence without a second Git mutation", async (t) => {
+  const fixture = await mutationFixture(t, async ({ path, record }) => {
+    await atomicCreateJson(path, record);
+  }, { detached: true });
+  git(fixture.repository, ["branch", "claimed/replay"]);
+  fixture.runner.commands.length = 0;
+  const input = {
+    repository: fixture.repository,
+    request_id: "018f47d2-7b2a-7d75-b9dd-5ea8abca0046",
+    expected_branch: null,
+    expected_head: fixture.snapshot.head,
+    branch: "claimed/replay",
+    expected_branch_head: fixture.snapshot.head,
+  } as const;
+
+  const first = await fixture.service.git_switch_attach(input);
+  const replay = await fixture.service.git_switch_attach(input);
+
+  assert.equal(first.status, "succeeded");
+  assert.deepEqual(replay, first);
+  assert.deepEqual(first.observed_before, {
+    branch: null,
+    head: fixture.snapshot.head,
+    index_tree: fixture.snapshot.indexTree,
+    target_branch: "claimed/replay",
+    target_head: fixture.snapshot.head,
+  });
+  assert.deepEqual(first.observed_after, { branch: "claimed/replay", head: fixture.snapshot.head });
+  assert.deepEqual(first.data, { branch: "claimed/replay", head: fixture.snapshot.head });
+  assert.equal(fixture.runner.commands.filter(
+    ({ args }) => JSON.stringify(args) === JSON.stringify(["switch", "--no-guess", "claimed/replay"]),
+  ).length, 1);
+
+  const reused = await fixture.service.git_switch_attach({ ...input, branch: "claimed/changed" });
+  assert.equal(reused.status, "rejected");
+  assert.equal(reused.error?.code, "REQUEST_ID_REUSED");
+  assert.equal(JSON.stringify(reused).includes("claimed/replay"), false);
+});
+
 test("bridge mutation cannot use a stale worktree root when a shared-gitdir alias retargets", async (t) => {
   const root = await mkdtemp(join(tmpdir(), "git-mcp-server-alias-"));
   const stateHome = await mkdtemp(join(tmpdir(), "git-mcp-server-alias-state-"));
