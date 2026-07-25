@@ -14,7 +14,7 @@ import {
 } from "./package-test-utils.js";
 
 const EXPECTED_TOOLS = [
-  "git_status", "git_diff", "git_switch_create", "git_add",
+  "git_status", "git_diff", "git_switch_create", "git_switch_attach", "git_add",
   "git_restore_staged", "git_restore_worktree", "git_commit", "git_fetch",
   "git_merge", "git_merge_continue", "git_merge_abort", "git_push",
   "git_operation_get",
@@ -44,6 +44,7 @@ const EXPECTED_ANNOTATIONS: Record<(typeof EXPECTED_TOOLS)[number], ToolAnnotati
   git_status: READ_ONLY,
   git_diff: READ_ONLY,
   git_switch_create: MUTATION,
+  git_switch_attach: MUTATION,
   git_add: MUTATION,
   git_restore_staged: DESTRUCTIVE,
   git_restore_worktree: DESTRUCTIVE,

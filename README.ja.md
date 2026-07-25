@@ -55,6 +55,12 @@ source build を使う場合は `node /absolute/path/dist/cli.js` で built serv
 MCP client の working directory は未定義の場合があるため、checkout への absolute path
 を使ってください。
 
+新しい tool を含む build を install した後は、MCP server process と、それを起動した
+client session を完全に restart し、client に新しい tool schema を再検出させます。
+この未公開 source 変更を使う場合は、実装 commit を checkout して
+`pnpm install --frozen-lockfile && pnpm build` を実行し、上記の absolute
+`dist/cli.js` 設定を保ったまま両 process を restart してください。
+
 ## Tools
 
 | Tool | Purpose |
@@ -62,6 +68,7 @@ MCP client の working directory は未定義の場合があるため、checkout
 | `git_status` | repository identity、branch、HEAD、index/worktree state、worktree snapshot ID を読む。 |
 | `git_diff` | 宣言した paths の byte-limited な worktree または staged diff を返す。 |
 | `git_switch_create` | attached または detached の branch state と HEAD の exact preflight 後に branch を作成して切り替える。 |
+| `git_switch_attach` | clean detached worktree を existing same-HEAD local branch へ exact current/target preflight 後に attach する。 |
 | `git_add` | 宣言した paths を stage するか、declared conflict paths を resolved にする。 |
 | `git_restore_staged` | stage session が所有する宣言済み paths を destructive に unstage する。 |
 | `git_restore_worktree` | worktree snapshot guard 後に宣言済み paths を destructive に restore する。 |
@@ -85,13 +92,24 @@ name を `git_switch_create.expected_branch` に渡します。`git_status` が 
 `git_merge_abort` を使います。request 後に transport が中断した場合は、同じ request ID
 で `git_operation_get` を使い durable result を replay し、mutation を繰り返しません。
 
+managed worktree を既存の claimed local branch に attach する場合は、まず `git_status` で
+`branch: null` を確認します。`git_switch_attach` には exact に `repository`、新しい
+`request_id`、`expected_branch: null`、返された full `expected_head`、local `branch`
+name、その full `expected_branch_head` を渡します。target branch は存在し、その expected
+および observed HEAD が detached worktree HEAD と同一で、別 worktree に checkout されて
+いない必要があります。current operation state は `none`、index と untracked paths を含む
+complete worktree は clean、active bridge session は存在しない必要があります。
+
 ## Safety boundaries
 
 trusted repositories だけで使ってください。inputs は明示的な repository-relative paths
 で、mutations には expected branch と HEAD preconditions が必要です。null の expected
-branch を受け付けるのは `git_switch_create` だけで、厳密に detached `HEAD` を意味します。
-ほかの mutations には attached branch name が必要です。native hooks は
-enabled であり repository-controlled code を実行することがあります。commits は
+`git_switch_create` は detached `HEAD` から branch を作成するため null expected branch を
+受け付けます。`git_switch_attach` は literal null expected branch を必須とし、attached
+starting state を受け付けません。ほかの mutations には attached branch name が必要です。
+attach は branch 作成、reset、force、remote access、dirty state の stash、arbitrary ref
+を一切許さず、mutation は native `git switch --no-guess <branch>` だけです。native hooks は enabled
+であり repository-controlled code を実行することがあります。commits は
 `--no-gpg-sign` を使います。server は hooks を bypass しません。destructive restore、
 merge-abort、merge、push は承認前に確認してください。
 

@@ -13,6 +13,7 @@ const EXPECTED_TOOLS = [
   ["git_status", "git-mcp-server: Git status", { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false }],
   ["git_diff", "git-mcp-server: Git diff", { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false }],
   ["git_switch_create", "git-mcp-server: Create branch", { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false }],
+  ["git_switch_attach", "git-mcp-server: Attach branch", { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false }],
   ["git_add", "git-mcp-server: Stage paths", { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false }],
   ["git_restore_staged", "git-mcp-server: Restore staged paths", { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false }],
   ["git_restore_worktree", "git-mcp-server: Restore worktree paths", { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false }],
@@ -288,6 +289,22 @@ test("MCP stdio progress and schema register all Git tools and serve structured 
     },
   });
   assert.equal(structuredResult(switched).status, "succeeded");
+
+  run("git", ["branch", "claimed/mcp"], fixture.repository);
+  run("git", ["checkout", "--detach"], fixture.repository);
+  const attached = await connected.client.callTool({
+    name: "git_switch_attach",
+    arguments: {
+      repository: fixture.repository,
+      request_id: "018f47d2-7b2a-7d75-b9dd-5ea8abca0039",
+      expected_branch: null,
+      expected_head: fixture.head,
+      branch: "claimed/mcp",
+      expected_branch_head: fixture.head,
+    },
+  });
+  assert.equal(structuredResult(attached).status, "succeeded");
+  assert.deepEqual(structuredResult(attached).data, { branch: "claimed/mcp", head: fixture.head });
 });
 
 test("MCP stdio cancellation aborts a long-running Git process without corrupting stdout", async (t) => {

@@ -159,6 +159,8 @@ export const switchCreateDataSchema = z.strictObject({
   head: objectId,
 });
 
+export const switchAttachDataSchema = switchCreateDataSchema;
+
 export const addDataSchema = z.strictObject({
   mode: z.string(),
   stage_id: z.string().nullable(),
@@ -225,6 +227,7 @@ const operationDataSchemas: Readonly<Record<string, z.ZodType>> = {
   git_status: statusDataSchema,
   git_diff: diffDataSchema,
   git_switch_create: switchCreateDataSchema,
+  git_switch_attach: switchAttachDataSchema,
   git_add: addDataSchema,
   git_restore_staged: restoreStagedDataSchema,
   git_restore_worktree: restoreWorktreeDataSchema,
@@ -248,6 +251,7 @@ export function validateOperationOutput(operation: string, data: unknown): unkno
 export type StatusData = z.infer<typeof statusDataSchema>;
 export type DiffData = z.infer<typeof diffDataSchema>;
 export type SwitchCreateData = z.infer<typeof switchCreateDataSchema>;
+export type SwitchAttachData = z.infer<typeof switchAttachDataSchema>;
 export type AddData = z.infer<typeof addDataSchema>;
 export type RestoreStagedData = z.infer<typeof restoreStagedDataSchema>;
 export type RestoreWorktreeData = z.infer<typeof restoreWorktreeDataSchema>;

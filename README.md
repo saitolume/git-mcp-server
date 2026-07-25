@@ -56,6 +56,12 @@ For a source build, run the built server with
 `node /absolute/path/dist/cli.js`. Use an absolute path to the checkout because
 an MCP client's working directory may be undefined.
 
+After installing a build that contains a new tool, fully restart the MCP server
+process and the client session that launched it so the client discovers the new
+tool schema. For this unreleased source change, check out the implementing
+commit, run `pnpm install --frozen-lockfile && pnpm build`, keep the absolute
+`dist/cli.js` configuration above, and restart both processes.
+
 ## Tools
 
 | Tool | Purpose |
@@ -63,6 +69,7 @@ an MCP client's working directory may be undefined.
 | `git_status` | Read repository identity, branch, HEAD, index/worktree state, and a worktree snapshot ID. |
 | `git_diff` | Return a byte-limited worktree or staged diff for declared paths. |
 | `git_switch_create` | Create and switch to a branch after exact attached-or-detached branch and HEAD preflight. |
+| `git_switch_attach` | Attach a clean detached worktree to an existing same-HEAD local branch after exact current and target preflight. |
 | `git_add` | Stage declared paths, or mark declared conflict paths resolved. |
 | `git_restore_staged` | Destructively unstage declared paths owned by a stage session. |
 | `git_restore_worktree` | Destructively restore declared paths after a worktree snapshot guard. |
@@ -87,15 +94,29 @@ declared merge must be abandoned. If transport is interrupted after a request,
 use the same request ID with `git_operation_get` to replay its durable result;
 do not repeat the mutation.
 
+To attach a managed worktree to an existing claimed local branch, first use
+`git_status` and require `branch: null`. Call `git_switch_attach` with exactly
+`repository`, a new `request_id`, `expected_branch: null`, the returned full
+`expected_head`, the local `branch` name, and its full
+`expected_branch_head`. The target branch must exist, its expected and observed
+HEAD must equal the detached worktree HEAD, and it must not be checked out in
+another worktree. The current operation state must be `none`; the index and
+complete worktree, including untracked paths, must be clean; and no bridge
+session may be active.
+
 ## Safety boundaries
 
 Use only trusted repositories. Inputs are explicit repository-relative paths
 and mutations require expected branch and HEAD preconditions. Only
-`git_switch_create` accepts a null expected branch, strictly meaning detached
-`HEAD`; other mutations require an attached branch name. Native hooks are
-enabled and may run repository-controlled code. Commits use `--no-gpg-sign`;
-the server does not bypass hooks. Review destructive restore, merge-abort,
-merge, and push operations before approving them.
+`git_switch_create` accepts a null expected branch to allow branch creation
+from detached `HEAD`. `git_switch_attach` requires a literal null expected
+branch and never accepts an attached starting state. Other mutations require an
+attached branch name. Attach never creates a branch, resets, forces, accesses a
+remote, stashes dirty state, or accepts an arbitrary ref; its only mutation is
+native `git switch --no-guess <branch>`. Native hooks are enabled and may run
+repository-controlled code. Commits use `--no-gpg-sign`; the server does not
+bypass hooks. Review destructive restore, merge-abort, merge, and push
+operations before approving them.
 
 The server is not an isolation boundary for intentionally malicious hooks
 running as the same operating-system user. Hook-failure redaction is a bounded

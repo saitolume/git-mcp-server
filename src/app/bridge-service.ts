@@ -3,17 +3,18 @@ import { isOperationDeadlineExceeded, throwIfDeadlineExceeded, withOperationDead
 import type {
   GitOperationGetInput, GitAddInput, GitCommitInput, GitDiffInput, GitFetchInput,
   GitMergeAbortInput, GitMergeContinueInput, GitMergeInput, GitPushInput,
-  GitRestoreStagedInput, GitRestoreWorktreeInput, GitStatusInput, GitSwitchCreateInput,
+  GitRestoreStagedInput, GitRestoreWorktreeInput, GitStatusInput, GitSwitchAttachInput, GitSwitchCreateInput,
 } from "../domain/inputs.js";
 import {
   BridgeRejection, failure, success,
   type AddData, type BridgeResult, type CommitData, type DiffData, type FetchData,
   type MergeAbortData, type MergeContinueData, type MergeData, type PushData,
-  type RestoreStagedData, type RestoreWorktreeData, type StatusData, type SwitchCreateData,
+  type RestoreStagedData, type RestoreWorktreeData, type StatusData, type SwitchAttachData, type SwitchCreateData,
 } from "../domain/result.js";
 import {
+  executePreparedSwitchAttach, prepareSwitchAttach, preparedSwitchAttachObservation,
   executePreparedSwitchCreate, prepareSwitchCreate, preparedSwitchCreateObservation,
-  type PreparedSwitchCreate,
+  type PreparedSwitchAttach, type PreparedSwitchCreate,
 } from "../git/branch.js";
 import {
   createCommitAfterPersistCleanup, executePreparedCommit, prepareCommit, preparedCommitObservation,
@@ -62,6 +63,7 @@ export interface BridgeService {
   git_status(input: GitStatusInput, signal?: AbortSignal, progress?: OperationProgress): Promise<BridgeResult<StatusData>>;
   git_diff(input: GitDiffInput, signal?: AbortSignal, progress?: OperationProgress): Promise<BridgeResult<DiffData>>;
   git_switch_create(input: GitSwitchCreateInput, signal?: AbortSignal, progress?: OperationProgress): Promise<BridgeResult<SwitchCreateData>>;
+  git_switch_attach(input: GitSwitchAttachInput, signal?: AbortSignal, progress?: OperationProgress): Promise<BridgeResult<SwitchAttachData>>;
   git_add(input: GitAddInput, signal?: AbortSignal, progress?: OperationProgress): Promise<BridgeResult<AddData>>;
   git_restore_staged(input: GitRestoreStagedInput, signal?: AbortSignal, progress?: OperationProgress): Promise<BridgeResult<RestoreStagedData>>;
   git_restore_worktree(input: GitRestoreWorktreeInput, signal?: AbortSignal, progress?: OperationProgress): Promise<BridgeResult<RestoreWorktreeData>>;
@@ -223,6 +225,26 @@ export class DefaultBridgeService implements BridgeService {
         mutate: async () => executePreparedSwitchCreate(this.dependencies.runner, prepared!, signal),
         postflight: async (value) => outputObservation(value),
         classify: (error) => classifyOperationError("git_switch_create", error),
+      };
+    }, signal, progress);
+  }
+
+  git_switch_attach(input: GitSwitchAttachInput, signal?: AbortSignal, progress?: OperationProgress): Promise<BridgeResult<SwitchAttachData>> {
+    return this.mutate("git_switch_attach", input, () => {
+      let prepared: PreparedSwitchAttach | undefined;
+      return {
+        preflight: async (snapshot) => {
+          prepared = await prepareSwitchAttach(this.dependencies.runner, this.dependencies.sessions, snapshot, {
+            expectedBranch: input.expected_branch,
+            expectedHead: input.expected_head,
+            branch: input.branch,
+            expectedBranchHead: input.expected_branch_head,
+          }, signal);
+          return preparedSwitchAttachObservation(prepared);
+        },
+        mutate: async () => executePreparedSwitchAttach(this.dependencies.runner, prepared!, signal),
+        postflight: async (value) => outputObservation(value),
+        classify: (error) => classifyOperationError("git_switch_attach", error),
       };
     }, signal, progress);
   }

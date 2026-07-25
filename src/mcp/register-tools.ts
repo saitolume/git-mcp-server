@@ -64,6 +64,8 @@ export function registerTools(
     invoke(context, active, (signal, report) => service.git_diff(input, signal, report)));
   server.registerTool("git_switch_create", TOOL_CATALOG.git_switch_create, (input, context) =>
     invoke(context, active, (signal, report) => service.git_switch_create(input, signal, report)));
+  server.registerTool("git_switch_attach", TOOL_CATALOG.git_switch_attach, (input, context) =>
+    invoke(context, active, (signal, report) => service.git_switch_attach(input, signal, report)));
   server.registerTool("git_add", TOOL_CATALOG.git_add, (input, context) =>
     invoke(context, active, (signal, report) => service.git_add(input, signal, report)));
   server.registerTool("git_restore_staged", TOOL_CATALOG.git_restore_staged, (input, context) =>
