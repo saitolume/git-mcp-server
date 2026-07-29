@@ -62,7 +62,7 @@ async function writeMinimalAllowedTree(
     "docs/acceptance/provider-checklist.md": "# Provider checklist\n",
     "package.json": JSON.stringify(manifest ?? {
       name: "@saitolume/git-mcp-server",
-      version: "0.1.0-beta.2",
+      version: "0.1.0-beta.3",
       license: "MIT",
       repository: {
         type: "git",
@@ -189,7 +189,7 @@ test("rejects wrong branch, configured remotes, dirty tracked files, manifest dr
     [{ dirtyTrackedFile: true }, "tracked_clean"],
     [{ manifest: {
       name: "wrong",
-      version: "0.1.0-beta.2",
+      version: "0.1.0-beta.3",
       license: "MIT",
       repository: { type: "git", url: "git+https://github.com/saitolume/git-mcp-server.git" },
       publishConfig: { access: "public", tag: "beta" },
@@ -220,7 +220,7 @@ test("finds every forbidden privacy token without embedding those tokens in this
 test("rejects tracked symlinks without following an allowed package manifest symlink", async () => {
   const validManifest = JSON.stringify({
     name: "@saitolume/git-mcp-server",
-    version: "0.1.0-beta.2",
+    version: "0.1.0-beta.3",
     license: "MIT",
     repository: {
       type: "git",
