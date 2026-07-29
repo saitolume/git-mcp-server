@@ -23,7 +23,7 @@ test("CI uses the pnpm-only supported runtime matrix", async () => {
     "pnpm check:git-version",
     "pnpm check:runtime-dependencies",
     "pnpm check",
-    "pnpm pack --dry-run --ignore-scripts",
+    "pnpm --config.ignore-scripts=true pack --dry-run",
     "pnpm test:package-install",
   ]) {
     assert.match(workflow, new RegExp(required.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
