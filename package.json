@@ -21,6 +21,7 @@
     "test": "pnpm test:compile && node --test .test-dist/test/*.test.js",
     "test:package-install": "pnpm build && pnpm test:compile && node --test .test-dist/test/package-install.integration.js",
     "check:git-version": "node scripts/check-git-version.mjs",
+    "check:release-request": "node scripts/check-release-request.mjs",
     "check:runtime-dependencies": "node scripts/check-runtime-dependencies.mjs",
     "check:publication": "node scripts/check-publication-readiness.mjs --repository .",
     "check": "pnpm check:git-version && pnpm check:runtime-dependencies && pnpm typecheck && pnpm build && pnpm test",
