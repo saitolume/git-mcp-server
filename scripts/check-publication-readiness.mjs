@@ -8,6 +8,7 @@ export const EXPECTED_AUTHOR = "Tadao Iseki <me@saitolume.com>";
 export const ALLOWED_ROOTS = Object.freeze(["src/", "test/", "scripts/"]);
 export const ALLOWED_FILES = new Set([
   ".github/workflows/ci.yml",
+  ".github/workflows/publish-npm.yml",
   ".gitignore",
   "LICENSE",
   "README.md",

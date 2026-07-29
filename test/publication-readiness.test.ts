@@ -53,6 +53,7 @@ async function writeMinimalAllowedTree(
 ): Promise<void> {
   const files: Readonly<Record<string, string>> = {
     ".github/workflows/ci.yml": "name: CI\n",
+    ".github/workflows/publish-npm.yml": "name: Publish npm beta\n",
     ".gitignore": "dist/\n",
     "LICENSE": "MIT License\n\nCopyright (c) 2026 saitolume\n",
     "README.md": "# git-mcp-server\n",
