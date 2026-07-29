@@ -34,6 +34,6 @@ jobs:
       - name: Run offline default quality gate
         run: pnpm check
       - name: Inspect package contents
-        run: pnpm pack --dry-run
+        run: pnpm pack --dry-run --ignore-scripts
       - name: Run opt-in fresh-cache package install integration
         run: pnpm test:package-install
