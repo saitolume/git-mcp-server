@@ -91,7 +91,7 @@ const title = (name: string): string => `${PRODUCT.displayName}: ${name}`;
 export const TOOL_CATALOG = {
   git_status: {
     title: title("Git status"),
-    description: "Operation: Inspect repository status without mutation. Returns: repository_id, branch and HEAD, opaque index_tree, worktree_snapshot_id, and exact path entries. Defaults: inspect the complete repository status. Excludes: read-only; no index refresh or write, object creation, file contents, or remote access.",
+    description: "Operation: Inspect repository status without mutation. Returns: repository_id, branch and HEAD, opaque index_tree, a content-complete worktree_snapshot_id for non-ignored Git-visible tracked deviations, gitlinks, and untracked leaves, plus exact path entries. Defaults: inspect the complete repository status; ordinary untracked directories expand to leaves. Excludes: ignored and empty-directory paths are outside the snapshot; nested repository directory records and special filesystem nodes are rejected; read-only with no index refresh or write, object creation, returned file contents, or remote access.",
     inputSchema: gitStatusInput,
     outputSchema: bridgeResultSchema(statusDataSchema),
     annotations: readOnlyAnnotations,

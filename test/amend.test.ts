@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, readlink, rm, symlink, unlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -52,6 +52,22 @@ class AmendOverrideRunner extends GitRunner {
   override async run(command: GitCommand, signal?: AbortSignal): Promise<GitCommandResult> {
     if (command.args[0] === "commit") return this.outcome;
     return this.delegate.run(command, signal);
+  }
+}
+
+class SideEffectAmendRunner extends GitRunner {
+  constructor(
+    private readonly delegate: GitRunner,
+    private readonly sideEffect: () => Promise<void>,
+    private readonly outcome: GitCommandResult | Error,
+  ) {
+    super(process.execPath, process.env);
+  }
+  override async run(command: GitCommand, signal?: AbortSignal): Promise<GitCommandResult> {
+    if (command.args[0] !== "commit") return this.delegate.run(command, signal);
+    await this.sideEffect();
+    if (this.outcome instanceof Error) throw this.outcome;
+    return this.outcome;
   }
 }
 
@@ -184,6 +200,53 @@ test("amends exact staged content without including unstaged changes", async (t)
   await cleanup(durable);
   assert.equal(await sessions.getStage(stage.stageId), null);
   assert.equal(await sessions.getActiveSession(stage.repositoryId), null);
+});
+
+test("preserves pre-existing unstaged regular content on an owned partially-staged path", async (t) => {
+  const { directory, runner, sessions, snapshot, stage } = await fixture(t);
+  await writeFile(join(directory, "owned.txt"), "owned unstaged user data\n");
+  const status = await readStatus(runner, snapshot);
+
+  const prepared = await prepareCommitAmend(runner, sessions, snapshot, {
+    expectedBranch: "main",
+    expectedHead: snapshot.head,
+    stageId: stage.stageId,
+    worktreeSnapshotId: status.worktree_snapshot_id,
+    message: "fix: preserve owned unstaged content\n",
+  });
+  const execution = await executePreparedCommitAmend(runner, prepared);
+
+  assert.notEqual(execution.data.commit, snapshot.head);
+  assert.equal(await git(runner, directory, ["show", "HEAD:owned.txt"]), "amended");
+  assert.equal(await readFile(join(directory, "owned.txt"), "utf8"), "owned unstaged user data\n");
+  assert.notEqual(await git(runner, directory, ["diff", "--", "owned.txt"]), "");
+  assert.ok(await sessions.getStage(stage.stageId));
+});
+
+test("preserves pre-existing unstaged symlink target on an owned partially-staged path", async (t) => {
+  const { directory, runner, sessions, stage } = await fixture(t);
+  await unlink(join(directory, "owned.txt"));
+  await symlink("staged-target", join(directory, "owned.txt"));
+  await git(runner, directory, ["add", "--", "owned.txt"]);
+  const stagedSnapshot = await inspectRepository(runner, directory);
+  const updatedStage = { ...stage, currentIndexTree: stagedSnapshot.indexTree };
+  await sessions.updateStageSession(updatedStage);
+  await unlink(join(directory, "owned.txt"));
+  await symlink("user-target", join(directory, "owned.txt"));
+  const status = await readStatus(runner, stagedSnapshot);
+
+  const prepared = await prepareCommitAmend(runner, sessions, stagedSnapshot, {
+    expectedBranch: "main",
+    expectedHead: stagedSnapshot.head,
+    stageId: updatedStage.stageId,
+    worktreeSnapshotId: status.worktree_snapshot_id,
+    message: "fix: preserve owned symlink target\n",
+  });
+  const execution = await executePreparedCommitAmend(runner, prepared);
+
+  assert.notEqual(execution.data.commit, stagedSnapshot.head);
+  assert.equal(await git(runner, directory, ["show", "HEAD:owned.txt"]), "staged-target");
+  assert.equal(await readlink(join(directory, "owned.txt")), "user-target");
 });
 
 test("preserves the complete parent set of a merge HEAD", async (t) => {
@@ -350,6 +413,38 @@ test("hook rejection retains the exact stage session for retry", async (t) => {
   assert.ok(await sessions.getStage(stage.stageId));
 });
 
+test("hook rejection with an untracked side effect is indeterminate", async (t) => {
+  const { directory, runner, sessions, snapshot, stage } = await fixture(t);
+  await hook(directory, "pre-commit", 'printf "hook side effect\n" > hook-side-effect.txt\nexit 31');
+  const worktreeSnapshotId = (await readStatus(runner, snapshot)).worktree_snapshot_id;
+  const prepared = await prepareCommitAmend(runner, sessions, snapshot, {
+    expectedBranch: "main", expectedHead: snapshot.head, stageId: stage.stageId,
+    worktreeSnapshotId, message: "fix: reject with side effect\n",
+  });
+  let caught: unknown;
+  try { await executePreparedCommitAmend(runner, prepared); } catch (error) { caught = error; }
+
+  assert.ok(caught instanceof ProvenMutationOutcome);
+  assert.equal(caught.result.status, "indeterminate");
+  assert.ok(await sessions.getStage(stage.stageId));
+});
+
+test("hook rejection with an index side effect is indeterminate", async (t) => {
+  const { directory, runner, sessions, snapshot, stage } = await fixture(t);
+  await hook(directory, "pre-commit", 'printf "hook index side effect\n" > hook-index.txt\ngit add -- hook-index.txt\nexit 31');
+  const worktreeSnapshotId = (await readStatus(runner, snapshot)).worktree_snapshot_id;
+  const prepared = await prepareCommitAmend(runner, sessions, snapshot, {
+    expectedBranch: "main", expectedHead: snapshot.head, stageId: stage.stageId,
+    worktreeSnapshotId, message: "fix: reject with index side effect\n",
+  });
+  let caught: unknown;
+  try { await executePreparedCommitAmend(runner, prepared); } catch (error) { caught = error; }
+
+  assert.ok(caught instanceof ProvenMutationOutcome);
+  assert.equal(caught.result.status, "indeterminate");
+  assert.ok(await sessions.getStage(stage.stageId));
+});
+
 test("amend hooks run with the sanitized inherited environment", async (t) => {
   const { directory, runner, sessions, snapshot, stage } = await fixture(t);
   await hook(directory, "pre-commit", 'test -n "${PATH:-}"\ntest -z "${BRIDGE_TEST_SECRET:-}"');
@@ -444,6 +539,30 @@ test("post-hook unstaged mutation of an owned path makes amend indeterminate", a
   assert.ok(await sessions.getStage(stage.stageId));
 });
 
+for (const [name, body] of [
+  ["deletion", "rm -- owned.txt"],
+  ["type mutation", "rm -- owned.txt\nmkdir owned.txt"],
+] as const) {
+  test(`post-hook owned-path ${name} makes amend indeterminate`, async (t) => {
+    const { directory, runner, sessions, snapshot, stage } = await fixture(t);
+    await hook(directory, "pre-commit", body);
+    const worktreeSnapshotId = (await readStatus(runner, snapshot)).worktree_snapshot_id;
+    const prepared = await prepareCommitAmend(runner, sessions, snapshot, {
+      expectedBranch: "main",
+      expectedHead: snapshot.head,
+      stageId: stage.stageId,
+      worktreeSnapshotId,
+      message: `fix: hook owned ${name}\n`,
+    });
+    let caught: unknown;
+    try { await executePreparedCommitAmend(runner, prepared); } catch (error) { caught = error; }
+
+    assert.ok(caught instanceof ProvenMutationOutcome);
+    assert.equal(caught.result.status, "indeterminate");
+    assert.ok(await sessions.getStage(stage.stageId));
+  });
+}
+
 test("timeout with unchanged HEAD is a proven failure retaining the stage session", async (t) => {
   const { runner, sessions, snapshot, stage, worktreeSnapshotId } = await fixture(t);
   const prepared = await prepareCommitAmend(runner, sessions, snapshot, {
@@ -464,6 +583,69 @@ test("timeout with unchanged HEAD is a proven failure retaining the stage sessio
   assert.ok(caught instanceof ProvenMutationOutcome);
   assert.equal(caught.result.status, "failed");
   assert.equal(caught.result.error?.code, "GIT_TIMEOUT");
+  assert.ok(await sessions.getStage(stage.stageId));
+});
+
+for (const [name, outcome, sideEffect] of [
+  ["timeout", commandResult({ exitCode: null, timedOut: true }), async (directory: string) => {
+    await writeFile(join(directory, "timeout-side-effect.txt"), "changed\n");
+  }],
+  ["abort", commandResult({ exitCode: null, aborted: true }), async (directory: string) => {
+    await unlink(join(directory, "owned.txt"));
+  }],
+] as const) {
+  test(`${name} with unchanged HEAD and a worktree side effect is indeterminate`, async (t) => {
+    const { directory, runner, sessions, snapshot, stage, worktreeSnapshotId } = await fixture(t);
+    const prepared = await prepareCommitAmend(runner, sessions, snapshot, {
+      expectedBranch: "main", expectedHead: snapshot.head, stageId: stage.stageId,
+      worktreeSnapshotId, message: `fix: ${name} side effect\n`,
+    });
+    let caught: unknown;
+    try {
+      await executePreparedCommitAmend(
+        new SideEffectAmendRunner(runner, () => sideEffect(directory), outcome), prepared,
+      );
+    } catch (error) { caught = error; }
+
+    assert.ok(caught instanceof ProvenMutationOutcome);
+    assert.equal(caught.result.status, "indeterminate");
+    assert.ok(await sessions.getStage(stage.stageId));
+  });
+}
+
+test("runner failure with unchanged HEAD and stage-record drift is indeterminate", async (t) => {
+  const { runner, sessions, snapshot, stage, worktreeSnapshotId } = await fixture(t);
+  const prepared = await prepareCommitAmend(runner, sessions, snapshot, {
+    expectedBranch: "main", expectedHead: snapshot.head, stageId: stage.stageId,
+    worktreeSnapshotId, message: "fix: runner failure side effect\n",
+  });
+  let caught: unknown;
+  try {
+    await executePreparedCommitAmend(new SideEffectAmendRunner(runner, async () => {
+      await sessions.updateStageSession({ ...stage, updatedAt: "2026-08-01T23:59:59.000Z" });
+    }, new Error("runner failed")), prepared);
+  } catch (error) { caught = error; }
+
+  assert.ok(caught instanceof ProvenMutationOutcome);
+  assert.equal(caught.result.status, "indeterminate");
+  assert.ok(await sessions.getStage(stage.stageId));
+});
+
+test("runner failure with unchanged HEAD and active-marker drift is indeterminate", async (t) => {
+  const { runner, sessions, paths, snapshot, stage, worktreeSnapshotId } = await fixture(t);
+  const prepared = await prepareCommitAmend(runner, sessions, snapshot, {
+    expectedBranch: "main", expectedHead: snapshot.head, stageId: stage.stageId,
+    worktreeSnapshotId, message: "fix: runner active-marker side effect\n",
+  });
+  let caught: unknown;
+  try {
+    await executePreparedCommitAmend(new SideEffectAmendRunner(runner, async () => {
+      await rm(join(paths.stages, `.active-${stage.repositoryId}.json`));
+    }, new Error("runner failed")), prepared);
+  } catch (error) { caught = error; }
+
+  assert.ok(caught instanceof ProvenMutationOutcome);
+  assert.equal(caught.result.status, "indeterminate");
   assert.ok(await sessions.getStage(stage.stageId));
 });
 

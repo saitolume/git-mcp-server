@@ -20,7 +20,10 @@ import {
   type CommitTreeEntry,
 } from "./commit.js";
 import { createHookWrappers } from "./hook-wrapper.js";
-import { readStatus, readUnownedWorktreeContentSnapshotId } from "./read.js";
+import {
+  readStatusWithWorktreeContentProof,
+  type WorktreeContentProof,
+} from "./read.js";
 import {
   assertMutationReady,
   inspectRepository,
@@ -75,8 +78,9 @@ interface CommitObjectProof {
 interface PreparedState {
   readonly snapshot: RepositorySnapshot;
   readonly record: StageRecord;
+  readonly sessions: SessionStore;
   readonly worktreeSnapshotId: string;
-  readonly unownedWorktreeSnapshotId: string;
+  readonly worktreeContentProof: WorktreeContentProof;
   readonly message: string;
   readonly hooksPath: string;
   readonly oldCommit: CommitObjectProof;
@@ -168,6 +172,35 @@ function ordinaryGitFailure(result: GitCommandResult): boolean {
     && !result.stdoutTruncated && !result.stderrTruncated;
 }
 
+async function proveUnchangedAmendFailure(
+  runner: GitRunner,
+  state: PreparedState,
+  after: RepositorySnapshot,
+): Promise<void> {
+  if (after.headTree !== state.snapshot.headTree || after.indexTree !== state.snapshot.indexTree
+    || after.indexMatchesHead !== state.snapshot.indexMatchesHead) {
+    throw new Error("Repository trees changed while amend HEAD remained unchanged");
+  }
+  const index = await readIndexStageMap(runner, after.root);
+  if (index.fingerprint !== after.indexTree || index.hasUnmergedEntries
+    || index.stageZeroTreeFingerprint !== state.preIndexTreeFingerprint) {
+    throw new Error("Complete prepared index proof changed while amend HEAD remained unchanged");
+  }
+  const statusProof = await readStatusWithWorktreeContentProof(
+    runner, after, state.worktreeContentProof.paths,
+  );
+  if (statusProof.status.worktree_snapshot_id !== state.worktreeSnapshotId
+    || statusProof.contentProof.snapshotId !== state.worktreeContentProof.snapshotId
+    || statusProof.contentProof.paths.length !== state.worktreeContentProof.paths.length) {
+    throw new Error("Worktree proof changed while amend HEAD remained unchanged");
+  }
+  const record = await state.sessions.getStage(state.record.stageId);
+  if (record === null || stageRecordHash(record) !== stageRecordHash(state.record)) {
+    throw new Error("Stage record changed while amend HEAD remained unchanged");
+  }
+  await state.sessions.assertActiveStage(record);
+}
+
 export async function prepareCommitAmend(
   runner: GitRunner,
   sessions: SessionStore,
@@ -188,13 +221,10 @@ export async function prepareCommitAmend(
   if (stagedPaths.count !== expectedPaths.count || stagedPaths.fingerprint !== expectedPaths.fingerprint) {
     reject("SESSION_MISMATCH", "Persisted stage ownership does not match the complete staged path set");
   }
-  const status = await readStatus(runner, before, signal);
-  if (status.worktree_snapshot_id !== input.worktreeSnapshotId) {
+  const statusProof = await readStatusWithWorktreeContentProof(runner, before, [], signal);
+  if (statusProof.status.worktree_snapshot_id !== input.worktreeSnapshotId) {
     reject("UNSUPPORTED_REPOSITORY_STATE", "Worktree snapshot changed before amend");
   }
-  const unownedWorktreeSnapshotId = await readUnownedWorktreeContentSnapshotId(
-    runner, before, record.ownedPaths, signal,
-  );
   const preIndex = await readIndexStageMap(runner, before.root, signal, new Set(record.ownedPaths));
   if (preIndex.fingerprint !== before.indexTree || preIndex.hasUnmergedEntries) {
     reject("INDEX_MISMATCH", "Repository index changed while preparing amend");
@@ -221,13 +251,15 @@ export async function prepareCommitAmend(
   if (finalPaths.count !== expectedPaths.count || finalPaths.fingerprint !== expectedPaths.fingerprint) {
     reject("SESSION_MISMATCH", "Stage ownership changed while preparing amend");
   }
-  const finalStatus = await readStatus(runner, finalBefore, signal);
-  if (finalStatus.worktree_snapshot_id !== input.worktreeSnapshotId) {
+  const finalStatusProof = await readStatusWithWorktreeContentProof(
+    runner, finalBefore, statusProof.contentProof.paths, signal,
+  );
+  if (finalStatusProof.status.worktree_snapshot_id !== input.worktreeSnapshotId) {
     reject("UNSUPPORTED_REPOSITORY_STATE", "Worktree snapshot changed while preparing amend");
   }
-  const finalUnowned = await readUnownedWorktreeContentSnapshotId(runner, finalBefore, record.ownedPaths, signal);
-  if (finalUnowned !== unownedWorktreeSnapshotId) {
-    reject("UNSUPPORTED_REPOSITORY_STATE", "Unowned worktree content changed while preparing amend");
+  if (finalStatusProof.contentProof.snapshotId !== statusProof.contentProof.snapshotId
+    || finalStatusProof.contentProof.paths.length !== statusProof.contentProof.paths.length) {
+    reject("UNSUPPORTED_REPOSITORY_STATE", "Worktree content changed while preparing amend");
   }
   const finalIndex = await readIndexStageMap(runner, finalBefore.root, signal, new Set(record.ownedPaths));
   if (finalIndex.fingerprint !== finalBefore.indexTree || finalIndex.hasUnmergedEntries
@@ -243,8 +275,9 @@ export async function prepareCommitAmend(
   preparedStates.set(prepared, {
     snapshot: Object.freeze({ ...finalBefore }),
     record: Object.freeze({ ...record, ownedPaths: Object.freeze([...record.ownedPaths]) }),
+    sessions,
     worktreeSnapshotId: input.worktreeSnapshotId,
-    unownedWorktreeSnapshotId,
+    worktreeContentProof: finalStatusProof.contentProof,
     message: input.message,
     hooksPath,
     oldCommit,
@@ -268,15 +301,15 @@ export async function executePreparedCommitAmend(
   if (beforeCommand.indexTree !== state.snapshot.indexTree) {
     reject("INDEX_MISMATCH", "Repository index changed before amend execution");
   }
-  const beforeCommandStatus = await readStatus(runner, beforeCommand, signal);
-  if (beforeCommandStatus.worktree_snapshot_id !== state.worktreeSnapshotId) {
+  const beforeCommandStatusProof = await readStatusWithWorktreeContentProof(
+    runner, beforeCommand, state.worktreeContentProof.paths, signal,
+  );
+  if (beforeCommandStatusProof.status.worktree_snapshot_id !== state.worktreeSnapshotId) {
     reject("UNSUPPORTED_REPOSITORY_STATE", "Worktree snapshot changed before amend execution");
   }
-  const beforeCommandUnowned = await readUnownedWorktreeContentSnapshotId(
-    runner, beforeCommand, state.record.ownedPaths, signal,
-  );
-  if (beforeCommandUnowned !== state.unownedWorktreeSnapshotId) {
-    reject("UNSUPPORTED_REPOSITORY_STATE", "Unowned worktree content changed before amend execution");
+  if (beforeCommandStatusProof.contentProof.snapshotId !== state.worktreeContentProof.snapshotId
+    || beforeCommandStatusProof.contentProof.paths.length !== state.worktreeContentProof.paths.length) {
+    reject("UNSUPPORTED_REPOSITORY_STATE", "Worktree content changed before amend execution");
   }
   let command: GitCommandResult | undefined;
   let wrappers: Awaited<ReturnType<typeof createHookWrappers>> | undefined;
@@ -303,6 +336,7 @@ export async function executePreparedCommitAmend(
       || after.gitDir !== state.snapshot.gitDir || after.commonGitDir !== state.snapshot.commonGitDir
       || after.branch !== state.record.branch || after.operationState !== "none") indeterminate();
     if (after.head === state.snapshot.head) {
+      try { await proveUnchangedAmendFailure(runner, state, after); } catch { indeterminate(); }
       if (command?.timedOut) {
         proven<CommitAmendData>({
           status: "failed", operation: "git_commit_amend", warnings: [],
@@ -332,11 +366,11 @@ export async function executePreparedCommitAmend(
       if (amendedTree.fingerprint !== state.preIndexTreeFingerprint || after.indexTree !== state.snapshot.indexTree) {
         indeterminate();
       }
-      const afterUnowned = await readUnownedWorktreeContentSnapshotId(runner, after, state.record.ownedPaths);
-      if (afterUnowned !== state.unownedWorktreeSnapshotId) indeterminate();
-      const afterStatus = await readStatus(runner, after);
-      const ownedPaths = new Set(state.record.ownedPaths);
-      if (afterStatus.entries.some(({ path }) => ownedPaths.has(path))) indeterminate();
+      const afterStatusProof = await readStatusWithWorktreeContentProof(
+        runner, after, state.worktreeContentProof.paths,
+      );
+      if (afterStatusProof.contentProof.snapshotId !== state.worktreeContentProof.snapshotId
+        || afterStatusProof.contentProof.paths.length !== state.worktreeContentProof.paths.length) indeterminate();
       changedPaths = await hookChangedPaths(
         runner,
         after.root,
@@ -382,7 +416,7 @@ export function preparedCommitAmendObservation(prepared: PreparedCommitAmend): C
     index_tree: state.record.currentIndexTree,
     worktree_snapshot_id: state.worktreeSnapshotId,
     stage_record_hash: stageRecordHash(state.record),
-    unowned_worktree_snapshot_id: state.unownedWorktreeSnapshotId,
+    unowned_worktree_snapshot_id: state.worktreeContentProof.snapshotId,
   });
 }
 

@@ -51,7 +51,7 @@ test("every tool declares complete annotations", () => {
 });
 
 const DESCRIPTION_FRAGMENTS: Readonly<Record<ExpectedToolName, readonly string[]>> = {
-  git_status: ["repository_id", "worktree_snapshot_id", "read-only"],
+  git_status: ["repository_id", "worktree_snapshot_id", "non-ignored", "read-only"],
   git_diff: ["max_bytes", "1000000", "omitted paths", "read-only"],
   git_switch_create: ["exact expected HEAD", "expected_branch", "null", "detached HEAD", "existing branch", "force"],
   git_switch_attach: ["existing local branch", "expected_branch_head", "detached HEAD", "same", "other worktree", "remote", "--no-guess"],

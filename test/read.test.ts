@@ -49,7 +49,7 @@ async function createRepository(t: test.TestContext): Promise<{ directory: strin
   return { directory, runner };
 }
 
-function isRejection(code: "INVALID_INPUT" | "PATH_OUTSIDE_REPOSITORY") {
+function isRejection(code: "INVALID_INPUT" | "PATH_OUTSIDE_REPOSITORY" | "UNSUPPORTED_REPOSITORY_STATE") {
   return (error: unknown): boolean => error instanceof BridgeRejection && error.error.code === code;
 }
 
@@ -404,6 +404,59 @@ test("status snapshot changes for same-path worktree content edits", async (t) =
   assert.equal(first.branch, "main");
   assert.ok(first.entries.some((entry: StatusEntry) => entry.path === "src/a.ts" && entry.kind === "ordinary"));
   assert.notEqual(second.worktree_snapshot_id, first.worktree_snapshot_id);
+});
+
+test("status snapshot changes for same-path untracked regular content edits", async (t) => {
+  const { directory, runner } = await createRepository(t);
+  const snapshot = await inspectRepository(runner, directory);
+  await writeFile(join(directory, "untracked.txt"), "first\n");
+  const first = await readStatus(runner, snapshot);
+
+  await writeFile(join(directory, "untracked.txt"), "second\n");
+  const second = await readStatus(runner, snapshot);
+
+  assert.notEqual(second.worktree_snapshot_id, first.worktree_snapshot_id);
+});
+
+test("status snapshot covers untracked symlink targets, add-delete, and type changes", async (t) => {
+  const { directory, runner } = await createRepository(t);
+  const snapshot = await inspectRepository(runner, directory);
+  const path = join(directory, "untracked-leaf");
+  await symlink("first-target", path);
+  const first = await readStatus(runner, snapshot);
+  await unlink(path);
+  await symlink("second-target", path);
+  const changedTarget = await readStatus(runner, snapshot);
+  await unlink(path);
+  const deleted = await readStatus(runner, snapshot);
+  await writeFile(path, "regular\n");
+  const changedType = await readStatus(runner, snapshot);
+
+  assert.notEqual(changedTarget.worktree_snapshot_id, first.worktree_snapshot_id);
+  assert.notEqual(deleted.worktree_snapshot_id, changedTarget.worktree_snapshot_id);
+  assert.notEqual(changedType.worktree_snapshot_id, deleted.worktree_snapshot_id);
+  assert.notEqual(changedType.worktree_snapshot_id, changedTarget.worktree_snapshot_id);
+});
+
+test("status expands untracked directories and rejects nested repositories and tracked FIFOs", async (t) => {
+  const { directory, runner } = await createRepository(t);
+  const snapshot = await inspectRepository(runner, directory);
+  await mkdir(join(directory, "untracked-directory"));
+  await writeFile(join(directory, "untracked-directory", "leaf"), "leaf\n");
+  const leafStatus = await readStatus(runner, snapshot);
+  assert.ok(leafStatus.entries.some((entry) => entry.path === "untracked-directory/leaf"));
+  await rm(join(directory, "untracked-directory"), { recursive: true, force: true });
+
+  await mkdir(join(directory, "nested"));
+  await runGit(runner, join(directory, "nested"), ["init"]);
+  await assert.rejects(readStatus(runner, snapshot), isRejection("UNSUPPORTED_REPOSITORY_STATE"));
+  await rm(join(directory, "nested"), { recursive: true, force: true });
+
+  const fifo = join(directory, "src", "a.ts");
+  await unlink(fifo);
+  const created = spawnSync("mkfifo", [fifo], { encoding: "utf8" });
+  assert.equal(created.status, 0, created.stderr);
+  await assert.rejects(readStatus(runner, snapshot), isRejection("UNSUPPORTED_REPOSITORY_STATE"));
 });
 
 test("status parser handles ordinary, renamed, unmerged, and untracked records", async (t) => {
