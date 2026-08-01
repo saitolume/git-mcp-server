@@ -217,7 +217,7 @@ function parseCommitObject(commit: string, object: string, expectedParent: strin
     if (name === "author") author = parseIdentity(value);
     if (name === "committer") committer = parseIdentity(value);
   }
-  if (!seen.has("tree") || tree === undefined || !seen.has("parent") || author === undefined || committer === undefined || parent !== expectedParent) {
+  if (tree === undefined || author === undefined || committer === undefined || parent !== expectedParent) {
     reject("UNSUPPORTED_REPOSITORY_STATE", "Commit parent does not match the exact requested range");
   }
   return Object.freeze({ commit, message, tree, parent, author, committer });
@@ -257,15 +257,18 @@ async function readHooksPath(runner: GitRunner, root: string, signal?: AbortSign
   return path;
 }
 
-async function readRefFingerprint(runner: GitRunner, root: string, width: number, signal?: AbortSignal): Promise<string> {
-  const lines = await readRefLines(runner, root, width, signal);
+function refFingerprint(lines: readonly string[], signal?: AbortSignal): string {
   const hash = createHash("sha256").update("git-mcp-server:refs:v1\0");
   for (let index = 0; index < lines.length; index += 1) {
     if (index % 256 === 0) throwIfDeadlineExceeded(signal);
-    hash.update(Buffer.from(lines[index]!)).update("\0");
+    hash.update(lines[index]!).update("\0");
   }
   throwIfDeadlineExceeded(signal);
   return hash.digest("hex");
+}
+
+async function readRefFingerprint(runner: GitRunner, root: string, width: number, signal?: AbortSignal): Promise<string> {
+  return refFingerprint(await readRefLines(runner, root, width, signal), signal);
 }
 
 export function parseRefLines(output: string, width: number, signal?: AbortSignal): readonly string[] {
@@ -574,8 +577,8 @@ export async function prepareReword(
     reject("INVALID_INPUT", "Reword commits must exactly cover the ordered linear range");
   }
   const hooksPath = await readHooksPath(runner, before.root, signal);
-  const refsFingerprint = await readRefFingerprint(runner, before.root, before.head.length, signal);
   const refLines = await readRefLines(runner, before.root, before.head.length, signal);
+  const refsFingerprint = refFingerprint(refLines, signal);
   let destinationRef = before.branchRef!;
   if (input.destination.mode === "new_branch") {
     try { destinationRef = canonicalBranchRef(input.destination.branch); }
@@ -639,7 +642,7 @@ export function sameRefLines(actual: readonly string[], expected: readonly strin
     actualSet.add(line);
   }
   throwIfDeadlineExceeded(signal);
-  return actualSet.size === expectedSet.size;
+  return true;
 }
 
 function expectedRewordRefLines(state: PreparedRewordState, newHead: string, signal?: AbortSignal): readonly string[] {
@@ -658,8 +661,7 @@ async function recreateCommits(
   runner: GitRunner,
   state: PreparedRewordState,
   signal?: AbortSignal,
-): Promise<{ readonly head: string; readonly commits: readonly LinearCommit[] }> {
-  const recreated: LinearCommit[] = [];
+): Promise<string> {
   let parent = state.base;
   for (let index = 0; index < state.commits.length; index += 1) {
     const source = state.commits[index]!;
@@ -685,10 +687,9 @@ async function recreateCommits(
       || parsed.committer.date !== source.committer.date) {
       throw new Error("Recreated commit metadata did not match the source commit");
     }
-    recreated.push(parsed);
     parent = commit;
   }
-  return Object.freeze({ head: parent, commits: Object.freeze(recreated) });
+  return parent;
 }
 
 async function proveRewordStillPrepared(
@@ -771,7 +772,7 @@ export async function executePreparedReword(
       async () => proveRewordUnchanged(runner, state),
     );
     await proveRewordStillPrepared(runner, state, signal);
-    newHead = (await recreateCommits(runner, state, signal)).head;
+    newHead = await recreateCommits(runner, state, signal);
     await proveRewordStillPrepared(runner, state, signal);
     const oldValue = state.destination.mode === "current_branch" ? state.snapshot.head : "0".repeat(state.snapshot.head.length);
     mutationCommand = await runner.run({

@@ -1031,14 +1031,14 @@ function pushIndeterminate(operation: "git_push" | "git_push_force_with_lease"):
   });
 }
 
-function pushCommandSucceeded(command: GitCommandResult | undefined): boolean {
+function pushCommandSucceeded(command: GitCommandResult | undefined): command is GitCommandResult {
   return command !== undefined && command.exitCode === 0 && command.signal === null
     && !command.timedOut && !command.aborted && !command.stdoutTruncated && !command.stderrTruncated;
 }
 
 function pushCommandClean(command: GitCommandResult | undefined): boolean {
-  return pushCommandSucceeded(command) && command!.stderr === ""
-    && !command!.stdout.includes("�") && !command!.stderr.includes("�");
+  return pushCommandSucceeded(command) && command.stderr === ""
+    && !command.stdout.includes("�") && !command.stderr.includes("�");
 }
 
 function pushFailureMessage(code: ReturnType<typeof failedCode>): string {
