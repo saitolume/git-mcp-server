@@ -28,6 +28,7 @@ test("operation classes expose absolute whole-operation budgets", () => {
   assert.equal(operationTimeoutMs("git_merge_abort"), 600_000);
   assert.equal(operationTimeoutMs("git_fetch"), 300_000);
   assert.equal(operationTimeoutMs("git_push"), 300_000);
+  assert.equal(operationTimeoutMs("git_push_force_with_lease"), 300_000);
 });
 
 test("one absolute deadline shrinks every later child budget", async () => {
@@ -61,7 +62,7 @@ test("generic failures observed after operation expiry classify uniformly as red
   const operations = [
     "git_status", "git_diff", "git_operation_get", "git_add", "git_restore_staged",
     "git_restore_worktree", "git_switch_create", "git_switch_attach", "git_commit", "git_commit_range_validate", "git_reword", "git_commit_amend", "git_merge",
-    "git_merge_continue", "git_merge_abort", "git_fetch", "git_push",
+    "git_merge_continue", "git_merge_abort", "git_fetch", "git_push", "git_push_force_with_lease",
   ];
 
   await withDeadline(10, undefined, async () => {

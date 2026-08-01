@@ -274,6 +274,7 @@ const operationDataSchemas: Readonly<Record<string, z.ZodType>> = {
   git_merge_continue: mergeContinueDataSchema,
   git_merge_abort: mergeAbortDataSchema,
   git_push: pushDataSchema,
+  git_push_force_with_lease: pushDataSchema,
   git_commit_range_validate: commitRangeValidateDataSchema,
   git_reword: rewordDataSchema,
   git_commit_amend: commitAmendDataSchema,

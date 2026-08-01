@@ -11,6 +11,7 @@ import {
   gitMergeAbortInput,
   gitMergeContinueInput,
   gitMergeInput,
+  gitPushForceWithLeaseInput,
   gitPushInput,
   gitRestoreStagedInput,
   gitRestoreWorktreeInput,
@@ -43,6 +44,7 @@ export const TOOL_NAMES = [
   "git_status", "git_diff", "git_switch_create", "git_switch_attach", "git_add",
   "git_restore_staged", "git_restore_worktree", "git_commit", "git_fetch",
   "git_merge", "git_merge_continue", "git_merge_abort", "git_push",
+  "git_push_force_with_lease",
   "git_commit_range_validate", "git_reword", "git_commit_amend",
   "git_operation_get",
 ] as const;
@@ -83,6 +85,11 @@ const destructiveMutationAnnotations = {
 
 const openWorldMutationAnnotations = {
   ...mutationAnnotations,
+  openWorldHint: true,
+} as const;
+
+const destructiveOpenWorldMutationAnnotations = {
+  ...destructiveMutationAnnotations,
   openWorldHint: true,
 } as const;
 
@@ -179,6 +186,13 @@ export const TOOL_CATALOG = {
     inputSchema: gitPushInput,
     outputSchema: bridgeResultSchema(pushDataSchema),
     annotations: openWorldMutationAnnotations,
+  },
+  git_push_force_with_lease: {
+    title: title("Force push with lease"),
+    description: "Operation: Replace the same-name current branch on origin using an exact caller-observed remote-head lease, including a non-fast-forward update. Returns: request_id, repository_id, local_head, and remote_head object IDs. Defaults: origin and the current branch destination are fixed, the exact lease is internal, native pre-push hooks run, and the complete Git-visible worktree snapshot must remain stable. Excludes: caller remote, refspec, force options, tags, deletion, hook bypass, stale remote state, active sessions, and automatic retry.",
+    inputSchema: gitPushForceWithLeaseInput,
+    outputSchema: bridgeResultSchema(pushDataSchema),
+    annotations: destructiveOpenWorldMutationAnnotations,
   },
   git_commit_range_validate: {
     title: title("Validate commit range"),

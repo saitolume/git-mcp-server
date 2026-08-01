@@ -4,7 +4,7 @@ import type {
   GitOperationGetInput, GitAddInput, GitCommitInput, GitDiffInput, GitFetchInput,
   GitMergeAbortInput, GitMergeContinueInput, GitMergeInput, GitPushInput,
   GitRestoreStagedInput, GitRestoreWorktreeInput, GitStatusInput, GitSwitchAttachInput, GitSwitchCreateInput,
-  GitCommitRangeValidateInput, GitRewordInput, GitCommitAmendInput,
+  GitCommitRangeValidateInput, GitRewordInput, GitCommitAmendInput, GitPushForceWithLeaseInput,
 } from "../domain/inputs.js";
 import {
   BridgeRejection, failure, success,
@@ -36,9 +36,9 @@ import {
 } from "../git/merge.js";
 import { readDiff, readStatus } from "../git/read.js";
 import {
-  executePreparedFetch, executePreparedPush, prepareFetchOrigin, preparePushOrigin,
-  preparedFetchObservation, preparedPushObservation,
-  type PreparedFetch, type PreparedPush, type PushExecutionOutcome,
+  executePreparedFetch, executePreparedForcePush, executePreparedPush, prepareFetchOrigin, prepareForcePushOrigin,
+  preparePushOrigin, preparedFetchObservation, preparedForcePushObservation, preparedPushObservation,
+  type PreparedFetch, type PreparedForcePush, type PreparedPush, type PushExecutionOutcome,
 } from "../git/remote.js";
 import { inspectRepository, resolveRepositoryIdentity, type RepositorySnapshot } from "../git/repository.js";
 import { executePreparedWorktreeRestore, prepareWorktreeRestore, type PreparedWorktreeRestore } from "../git/restore.js";
@@ -84,6 +84,7 @@ export interface BridgeService {
   git_merge_continue(input: GitMergeContinueInput, signal?: AbortSignal, progress?: OperationProgress): Promise<BridgeResult<MergeContinueData>>;
   git_merge_abort(input: GitMergeAbortInput, signal?: AbortSignal, progress?: OperationProgress): Promise<BridgeResult<MergeAbortData>>;
   git_push(input: GitPushInput, signal?: AbortSignal, progress?: OperationProgress): Promise<BridgeResult<PushData>>;
+  git_push_force_with_lease(input: GitPushForceWithLeaseInput, signal?: AbortSignal, progress?: OperationProgress): Promise<BridgeResult<PushData>>;
   git_commit_range_validate(input: GitCommitRangeValidateInput, signal?: AbortSignal, progress?: OperationProgress): Promise<BridgeResult<CommitRangeValidateData>>;
   git_reword(input: GitRewordInput, signal?: AbortSignal, progress?: OperationProgress): Promise<BridgeResult<RewordData>>;
   git_commit_amend(input: GitCommitAmendInput, signal?: AbortSignal, progress?: OperationProgress): Promise<BridgeResult<CommitAmendData>>;
@@ -511,6 +512,34 @@ export class DefaultBridgeService implements BridgeService {
         postflight: async (value) => outputObservation(value),
         warnings: () => outcome?.warnings ?? [],
         classify: (error) => classifyOperationError("git_push", error),
+      };
+    }, signal, progress);
+  }
+
+  git_push_force_with_lease(
+    input: GitPushForceWithLeaseInput,
+    signal?: AbortSignal,
+    progress?: OperationProgress,
+  ): Promise<BridgeResult<PushData>> {
+    return this.mutate("git_push_force_with_lease", input, () => {
+      let prepared: PreparedForcePush | undefined;
+      let outcome: PushExecutionOutcome | undefined;
+      return {
+        preflight: async (snapshot) => {
+          prepared = await prepareForcePushOrigin(this.dependencies.runner, this.dependencies.sessions, snapshot, {
+            expectedBranch: input.expected_branch,
+            expectedHead: input.expected_head,
+            expectedRemoteHead: input.expected_remote_head,
+          }, signal);
+          return preparedForcePushObservation(prepared);
+        },
+        mutate: async () => {
+          outcome = await executePreparedForcePush(this.dependencies.runner, prepared!, signal);
+          return outcome.data;
+        },
+        postflight: async (value) => outputObservation(value),
+        warnings: () => outcome?.warnings ?? [],
+        classify: (error) => classifyOperationError("git_push_force_with_lease", error),
       };
     }, signal, progress);
   }

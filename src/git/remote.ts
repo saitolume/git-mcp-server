@@ -9,7 +9,7 @@ import { OPERATION_TIMEOUT_MS } from "../product.js";
 import { validateOriginRemoteRef, type FetchRecord } from "../state/records.js";
 import type { SessionStore } from "../state/session-store.js";
 import { assertMutationReady, canonicalBranchRef, inspectRepository, validateFullRef, type RepositorySnapshot } from "./repository.js";
-import { readPushTrackedWorktreeSnapshotId } from "./read.js";
+import { readPushTrackedWorktreeSnapshotId, readStatusWithWorktreeContentProof } from "./read.js";
 import type { GitCommandResult, GitRunner } from "./runner.js";
 import {
   COMPLETE_RECORD_MAX_BYTES,
@@ -63,11 +63,26 @@ export interface PreparedPush {
   readonly remoteIdentity: string;
 }
 
+/** Opaque, one-shot authority for one exact non-fast-forward origin update. */
+export interface PreparedForcePush {
+  readonly remoteIdentity: string;
+}
+
 export interface PushPreflightObservation extends Readonly<Record<string, unknown>> {
   readonly branch: string;
   readonly local_head: string;
   readonly index_tree: string;
   readonly tracked_worktree_snapshot_id: string;
+  readonly remote_identity: string;
+  readonly remote_head: string | null;
+  readonly push_policy_hash: string;
+}
+
+export interface ForcePushPreflightObservation extends Readonly<Record<string, unknown>> {
+  readonly branch: string;
+  readonly local_head: string;
+  readonly index_tree: string;
+  readonly worktree_snapshot_id: string;
   readonly remote_identity: string;
   readonly remote_head: string | null;
   readonly push_policy_hash: string;
@@ -94,7 +109,10 @@ interface PreparedState {
 interface PreparedPushState {
   readonly snapshot: RepositorySnapshot;
   readonly branchRef: string;
-  readonly trackedWorktreeSnapshotId: string;
+  readonly worktreeProof: "tracked" | "complete";
+  readonly worktreeSnapshotId: string;
+  readonly worktreePaths?: readonly string[];
+  readonly worktreeContentSnapshotId?: string;
   readonly remoteIdentity: string;
   readonly remoteHead: string | null;
   readonly pushPolicyHash: string;
@@ -162,6 +180,7 @@ const FETCH_POLICY_HASH = createHash("sha256")
   .digest("hex");
 const preparedStates = new WeakMap<PreparedFetch, PreparedState>();
 const preparedPushStates = new WeakMap<PreparedPush, PreparedPushState>();
+const preparedForcePushStates = new WeakMap<PreparedForcePush, PreparedPushState>();
 
 function remoteRejected(): never {
   throw new BridgeRejection({ code: "REMOTE_URL_REJECTED", message: "Origin remote URL is not allowed" });
@@ -871,7 +890,8 @@ export async function preparePushOrigin(
   preparedPushStates.set(prepared, {
     snapshot: Object.freeze({ ...finalBefore }),
     branchRef: canonicalRef,
-    trackedWorktreeSnapshotId: finalTrackedSnapshotId,
+    worktreeProof: "tracked",
+    worktreeSnapshotId: finalTrackedSnapshotId,
     remoteIdentity,
     remoteHead: finalRemoteHead,
     pushPolicyHash: finalPolicy.hash,
@@ -887,17 +907,96 @@ export function preparedPushObservation(prepared: PreparedPush): PushPreflightOb
     branch: state.snapshot.branch!,
     local_head: state.snapshot.head,
     index_tree: state.snapshot.indexTree,
-    tracked_worktree_snapshot_id: state.trackedWorktreeSnapshotId,
+    tracked_worktree_snapshot_id: state.worktreeSnapshotId,
     remote_identity: state.remoteIdentity,
     remote_head: state.remoteHead,
     push_policy_hash: state.pushPolicyHash,
   });
 }
 
-function pushIndeterminate(): never {
+/**
+ * Prepares one exact same-name origin update. It intentionally omits only the
+ * fast-forward ancestry proof used by preparePushOrigin.
+ */
+export async function prepareForcePushOrigin(
+  runner: GitRunner,
+  sessions: SessionStore,
+  snapshot: RepositorySnapshot,
+  input: PushRequest,
+  signal?: AbortSignal,
+): Promise<PreparedForcePush> {
+  assertPushRequest(input);
+  if (snapshot.branch !== null && snapshot.branchRef !== pushBranchRef(snapshot.branch)) {
+    pushRejected("INVALID_INPUT", "Push branch ref is invalid");
+  }
+  const before = await inspectRepository(runner, snapshot.root, signal);
+  assertPushIdentity(snapshot, before);
+  assertMutationReady(before, input.expectedBranch, input.expectedHead);
+  await sessions.assertNoActiveSession(before.repositoryId);
+  const canonicalRef = pushBranchRef(before.branch!);
+  if (before.branchRef !== canonicalRef) pushRejected("INVALID_INPUT", "Push branch ref is invalid");
+  const worktree = await readStatusWithWorktreeContentProof(runner, before, [], signal);
+  const policy = await readPushPolicy(runner, before.root, signal);
+  const remoteHead = await readRemoteBranchHead(runner, before, before.branch!, signal);
+  assertExpectedRemoteHead(input.expectedRemoteHead, remoteHead);
+
+  const finalBefore = await inspectRepository(runner, before.root, signal);
+  assertPushIdentity(before, finalBefore);
+  assertMutationReady(finalBefore, input.expectedBranch, input.expectedHead);
+  await sessions.assertNoActiveSession(finalBefore.repositoryId);
+  if (!sameLocalState(before, finalBefore)) {
+    pushRejected("INDEX_MISMATCH", "Local repository state changed while preparing push");
+  }
+  const finalWorktree = await readStatusWithWorktreeContentProof(
+    runner,
+    finalBefore,
+    worktree.contentProof.paths,
+    signal,
+  );
+  if (finalWorktree.status.worktree_snapshot_id !== worktree.status.worktree_snapshot_id
+    || finalWorktree.contentProof.snapshotId !== worktree.contentProof.snapshotId
+    || finalWorktree.contentProof.paths.join("\0") !== worktree.contentProof.paths.join("\0")) {
+    pushRejected("INDEX_MISMATCH", "Local repository state changed while preparing push");
+  }
+  const finalPolicy = await readPushPolicy(runner, finalBefore.root, signal);
+  if (finalPolicy.hash !== policy.hash || !sameRemoteIdentity(finalPolicy.remote, policy.remote)) pushPolicyRejected();
+  const finalRemoteHead = await readRemoteBranchHead(runner, finalBefore, finalBefore.branch!, signal);
+  assertExpectedRemoteHead(input.expectedRemoteHead, finalRemoteHead);
+
+  const remoteIdentity = remoteIdentityString(finalPolicy.remote);
+  const prepared = Object.freeze({ remoteIdentity });
+  preparedForcePushStates.set(prepared, {
+    snapshot: Object.freeze({ ...finalBefore }),
+    branchRef: canonicalRef,
+    worktreeProof: "complete",
+    worktreeSnapshotId: finalWorktree.status.worktree_snapshot_id,
+    worktreePaths: Object.freeze([...finalWorktree.contentProof.paths]),
+    worktreeContentSnapshotId: finalWorktree.contentProof.snapshotId,
+    remoteIdentity,
+    remoteHead: finalRemoteHead,
+    pushPolicyHash: finalPolicy.hash,
+  });
+  return prepared;
+}
+
+export function preparedForcePushObservation(prepared: PreparedForcePush): ForcePushPreflightObservation {
+  const state = preparedForcePushStates.get(prepared);
+  if (state === undefined) pushRejected("INVALID_INPUT", "Prepared force-push authority is invalid or already consumed");
+  return Object.freeze({
+    branch: state.snapshot.branch!,
+    local_head: state.snapshot.head,
+    index_tree: state.snapshot.indexTree,
+    worktree_snapshot_id: state.worktreeSnapshotId,
+    remote_identity: state.remoteIdentity,
+    remote_head: state.remoteHead,
+    push_policy_hash: state.pushPolicyHash,
+  });
+}
+
+function pushIndeterminate(operation: "git_push" | "git_push_force_with_lease"): never {
   proven<PushData>({
     status: "indeterminate",
-    operation: "git_push",
+    operation,
     warnings: [],
     error: { code: "OPERATION_INDETERMINATE", message: "Push started but its final remote state could not be confirmed" },
   });
@@ -929,6 +1028,15 @@ export async function executePreparedPush(
   if (state === undefined) pushRejected("INVALID_INPUT", "Prepared push authority is invalid or already consumed");
   preparedPushStates.delete(prepared);
 
+  return executePreparedPushState(runner, state, "git_push", signal);
+}
+
+async function executePreparedPushState(
+  runner: GitRunner,
+  state: PreparedPushState,
+  operation: "git_push" | "git_push_force_with_lease",
+  signal?: AbortSignal,
+): Promise<PushExecutionOutcome> {
   let command: GitCommandResult | undefined;
   try {
     command = await runner.run({
@@ -948,30 +1056,42 @@ export async function executePreparedPush(
 
   return withReconciliationDeadline(async () => {
   let after: RepositorySnapshot;
-  let trackedSnapshotAfter: string;
+  let worktreeSnapshotAfter: string;
+  let worktreeContentSnapshotAfter: string | undefined;
+  let worktreePathsAfter: readonly string[] | undefined;
   let policyAfter: PushPolicyProof;
   let remoteHeadAfter: string | null;
   try {
     after = await inspectRepository(runner, state.snapshot.root);
-    trackedSnapshotAfter = await readPushTrackedWorktreeSnapshotId(runner, after);
+    if (state.worktreeProof === "tracked") {
+      worktreeSnapshotAfter = await readPushTrackedWorktreeSnapshotId(runner, after);
+    } else {
+      const worktree = await readStatusWithWorktreeContentProof(runner, after, state.worktreePaths ?? []);
+      worktreeSnapshotAfter = worktree.status.worktree_snapshot_id;
+      worktreeContentSnapshotAfter = worktree.contentProof.snapshotId;
+      worktreePathsAfter = worktree.contentProof.paths;
+    }
     policyAfter = await readPushPolicy(runner, after.root);
     remoteHeadAfter = await readRemoteBranchHead(runner, after, after.branch!);
     const finalPolicy = await readPushPolicy(runner, after.root);
-    if (policyAfter.hash !== finalPolicy.hash || !sameRemoteIdentity(policyAfter.remote, finalPolicy.remote)) pushIndeterminate();
+    if (policyAfter.hash !== finalPolicy.hash || !sameRemoteIdentity(policyAfter.remote, finalPolicy.remote)) pushIndeterminate(operation);
   } catch (error) {
     if (error instanceof ProvenMutationOutcome) throw error;
-    pushIndeterminate();
+    pushIndeterminate(operation);
   }
 
   if (!sameLocalState(state.snapshot, after!)
-    || trackedSnapshotAfter! !== state.trackedWorktreeSnapshotId
+    || worktreeSnapshotAfter! !== state.worktreeSnapshotId
+    || (state.worktreeProof === "complete"
+      && (worktreeContentSnapshotAfter !== state.worktreeContentSnapshotId
+        || worktreePathsAfter?.join("\0") !== state.worktreePaths?.join("\0")))
     || policyAfter!.hash !== state.pushPolicyHash
     || remoteIdentityString(policyAfter!.remote) !== state.remoteIdentity) {
-    pushIndeterminate();
+    pushIndeterminate(operation);
   }
 
   if (remoteHeadAfter! === state.snapshot.head) {
-    if (!pushCommandSucceeded(command)) pushIndeterminate();
+    if (!pushCommandSucceeded(command)) pushIndeterminate(operation);
     const warnings = pushCommandClean(command)
       ? []
       : ["Git push completion was not clean after the remote update was proven"];
@@ -985,13 +1105,24 @@ export async function executePreparedPush(
     const code = failedCode(command);
     proven<PushData>({
       status: "failed",
-      operation: "git_push",
+      operation,
       warnings: [],
       error: { code, message: pushFailureMessage(code) },
     });
   }
-  pushIndeterminate();
+  pushIndeterminate(operation);
   });
+}
+
+export async function executePreparedForcePush(
+  runner: GitRunner,
+  prepared: PreparedForcePush,
+  signal?: AbortSignal,
+): Promise<PushExecutionOutcome> {
+  const state = preparedForcePushStates.get(prepared);
+  if (state === undefined) pushRejected("INVALID_INPUT", "Prepared force-push authority is invalid or already consumed");
+  preparedForcePushStates.delete(prepared);
+  return executePreparedPushState(runner, state, "git_push_force_with_lease", signal);
 }
 
 /** Convenience wrapper; Task 14 must wire prepare and execute on opposite sides of mutationStarted. */
