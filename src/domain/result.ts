@@ -268,6 +268,7 @@ const operationDataSchemas: Readonly<Record<string, z.ZodType>> = {
   git_merge_continue: mergeContinueDataSchema,
   git_merge_abort: mergeAbortDataSchema,
   git_push: pushDataSchema,
+  git_commit_range_validate: commitRangeValidateDataSchema,
 };
 
 /** Validates persisted data against the exact public output schema for its operation. */

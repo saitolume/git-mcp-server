@@ -1,6 +1,7 @@
 import { z } from "zod";
 import {
   gitOperationGetInput,
+  gitCommitRangeValidateInput,
   gitAddInput,
   gitCommitInput,
   gitDiffInput,
@@ -30,6 +31,7 @@ import {
   statusDataSchema,
   switchAttachDataSchema,
   switchCreateDataSchema,
+  commitRangeValidateDataSchema,
 } from "../domain/result.js";
 import { PRODUCT } from "../product.js";
 
@@ -37,6 +39,7 @@ export const TOOL_NAMES = [
   "git_status", "git_diff", "git_switch_create", "git_switch_attach", "git_add",
   "git_restore_staged", "git_restore_worktree", "git_commit", "git_fetch",
   "git_merge", "git_merge_continue", "git_merge_abort", "git_push",
+  "git_commit_range_validate",
   "git_operation_get",
 ] as const;
 
@@ -172,6 +175,13 @@ export const TOOL_CATALOG = {
     inputSchema: gitPushInput,
     outputSchema: bridgeResultSchema(pushDataSchema),
     annotations: openWorldMutationAnnotations,
+  },
+  git_commit_range_validate: {
+    title: title("Validate commit range"),
+    description: "Operation: Validate every commit in the exact linear base..HEAD range with the configured native commit-msg hook. Returns: request_id, repository_id, exact base and head IDs, count, and hook kind. Defaults: the current branch and HEAD must match exactly, and every range commit is checked in order. Excludes: reword, amend, force push, hook bypass, hook diagnostics, and success after any hook changes the index, worktree, or refs.",
+    inputSchema: gitCommitRangeValidateInput,
+    outputSchema: bridgeResultSchema(commitRangeValidateDataSchema),
+    annotations: mutationAnnotations,
   },
   git_operation_get: {
     title: title("Get operation"),

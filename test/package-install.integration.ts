@@ -17,6 +17,7 @@ const EXPECTED_TOOLS = [
   "git_status", "git_diff", "git_switch_create", "git_switch_attach", "git_add",
   "git_restore_staged", "git_restore_worktree", "git_commit", "git_fetch",
   "git_merge", "git_merge_continue", "git_merge_abort", "git_push",
+  "git_commit_range_validate",
   "git_operation_get",
 ] as const;
 
@@ -54,6 +55,7 @@ const EXPECTED_ANNOTATIONS: Record<(typeof EXPECTED_TOOLS)[number], ToolAnnotati
   git_merge_continue: DESTRUCTIVE,
   git_merge_abort: DESTRUCTIVE,
   git_push: OPEN_WORLD,
+  git_commit_range_validate: MUTATION,
   git_operation_get: READ_ONLY,
 };
 

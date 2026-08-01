@@ -511,6 +511,36 @@ test("operation journal never persists a raw commit message but hashes it for re
   assert.equal(replay.kind, "replay");
 });
 
+test("operation journal redacts every guarded-history replacement message while retaining the original request hash", async (t) => {
+  const paths = await temporaryState(t);
+  const journal = new OperationJournal(paths, { now: () => timestamp, pid: 123 });
+  const reword = {
+    requestId: "reword-message-secret", operation: "git_reword", repositoryId,
+    input: {
+      repository: "/repo", expected_branch: "main", expected_head: objectId, base: objectId,
+      commits: [{ commit: objectId, message: "reword synthetic secret" }], destination: { mode: "current_branch" },
+    },
+  };
+  const amend = {
+    requestId: "amend-message-secret", operation: "git_commit_amend", repositoryId,
+    input: {
+      repository: "/repo", expected_branch: "main", expected_head: objectId, stage_id: "stage-1",
+      worktree_snapshot_id: "a".repeat(64), message: "amend synthetic secret",
+    },
+  };
+  await journal.begin(reword);
+  await journal.begin(amend);
+  const persisted = await Promise.all([reword, amend].map(async ({ requestId }) =>
+    readFile(join(paths.operations, requestId, "request.json"), "utf8")));
+  for (const value of persisted) {
+    assert.match(value, /\[COMMIT_MESSAGE_REDACTED\]/);
+    assert.doesNotMatch(value, /synthetic secret/);
+  }
+  await assert.rejects(journal.begin({
+    ...reword, input: { ...reword.input, commits: [{ commit: objectId, message: "different synthetic secret" }] },
+  }), (error) => error instanceof BridgeRejection && error.error.code === "REQUEST_ID_REUSED");
+});
+
 test("operation journal preserves validated colon paths and rejects malformed operation output", async (t) => {
   const paths = await temporaryState(t);
   const journal = new OperationJournal(paths, { now: () => timestamp, pid: 123 });

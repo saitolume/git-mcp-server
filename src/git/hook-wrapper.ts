@@ -23,6 +23,22 @@ export interface HookWrapperSet {
   cleanup(): Promise<void>;
 }
 
+/** Creates a private, permission-restricted commit message file for `git hook run`. */
+export async function withNativeCommitMessageFile<T>(
+  message: string,
+  execute: (path: string) => Promise<T>,
+): Promise<T> {
+  const directory = await mkdtemp(join(tmpdir(), "git-mcp-server-commit-msg-"));
+  const path = join(directory, "message");
+  try {
+    await chmod(directory, 0o700);
+    await writeFile(path, message, { encoding: "utf8", mode: 0o600 });
+    return await execute(path);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+}
+
 function shellQuote(value: string): string {
   return `'${value.replaceAll("'", `'\\''`)}'`;
 }

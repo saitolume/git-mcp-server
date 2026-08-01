@@ -23,6 +23,7 @@ const EXPECTED_TOOL_NAMES = [
   "git_status", "git_diff", "git_switch_create", "git_switch_attach", "git_add",
   "git_restore_staged", "git_restore_worktree", "git_commit", "git_fetch",
   "git_merge", "git_merge_continue", "git_merge_abort", "git_push",
+  "git_commit_range_validate",
   "git_operation_get",
 ] as const;
 type ExpectedToolName = (typeof EXPECTED_TOOL_NAMES)[number];
@@ -33,7 +34,7 @@ const expectedCatalog = TOOL_CATALOG as unknown as Record<ExpectedToolName, {
   outputSchema: { safeParse: unknown };
 }>;
 
-test("the catalog contains the approved 14 Git tools", () => {
+test("the catalog contains the approved 15 Git tools", () => {
   assert.deepEqual(TOOL_NAMES, EXPECTED_TOOL_NAMES);
 });
 
@@ -63,6 +64,7 @@ const DESCRIPTION_FRAGMENTS: Readonly<Record<ExpectedToolName, readonly string[]
   git_merge_continue: ["merge_session_id", "commit", "external"],
   git_merge_abort: ["merge_session_id", "head", "external"],
   git_push: ["local_head", "remote_head", "non-fast-forward", "delete"],
+  git_commit_range_validate: ["linear", "commit-msg", "base", "reword", "hook bypass"],
   git_operation_get: ["request_id", "stored terminal result", "Git", "retry"],
 };
 
