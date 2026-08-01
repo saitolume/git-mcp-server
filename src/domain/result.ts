@@ -227,7 +227,7 @@ export const pushDataSchema = z.strictObject({
 export const commitRangeValidateDataSchema = z.strictObject({
   base: objectId,
   head: objectId,
-  commit_count: z.number().int().min(1),
+  commit_count: z.number().int().min(1).max(128),
   hook: z.literal("commit-msg"),
 });
 

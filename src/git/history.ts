@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { remainingDeadlineTimeoutMs } from "../deadline.js";
+import { remainingDeadlineTimeoutMs, withReconciliationDeadline } from "../deadline.js";
 import { assertWellFormedGitText, isWellFormedGitText } from "../domain/git-text.js";
 import { BridgeRejection, HOOK_FAILED_MESSAGE, type CommitRangeValidateData } from "../domain/result.js";
 import { ProvenMutationOutcome } from "../app/mutation-coordinator.js";
@@ -320,6 +320,7 @@ export async function validateMessagesWithNativeHook(
   messages: readonly string[],
   signal?: AbortSignal,
   afterEach?: () => Promise<void>,
+  hookWrappersFactory: typeof createHookWrappers = createHookWrappers,
 ): Promise<void> {
   for (const message of messages) {
     assertWellFormedGitText(message, "Commit message");
@@ -328,7 +329,7 @@ export async function validateMessagesWithNativeHook(
     let executionError: unknown;
     let cleanupError: unknown;
     try {
-      wrappers = await createHookWrappers(hooksPath);
+      wrappers = await hookWrappersFactory(hooksPath);
       const activeWrappers = wrappers;
       result = await withNativeCommitMessageFile(message, async (path) => runner.run({
         cwd: root, args: ["hook", "run", "--ignore-missing", "commit-msg", "--", path],
@@ -342,7 +343,9 @@ export async function validateMessagesWithNativeHook(
     catch (error) { cleanupError = error; }
     // This callback is deliberately run even after reject/timeout/abort/wrapper failures.
     // A state change is stronger evidence than the hook's private diagnostic outcome.
-    await afterEach?.();
+    // Never inherit an operation deadline or caller cancellation here. This is
+    // the mandatory post-hook proof and must receive its own bounded budget.
+    if (afterEach !== undefined) await withReconciliationDeadline(async () => afterEach());
     if (executionError !== undefined || cleanupError !== undefined) {
       throw executionError ?? cleanupError;
     }

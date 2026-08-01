@@ -269,6 +269,12 @@ test("guarded history result schemas expose only the published payloads", () => 
   assert.equal(commitRangeValidateDataSchema.safeParse({
     base: "a".repeat(40), head: "b".repeat(40), commit_count: 1, hook: "commit-msg",
   }).success, true);
+  assert.equal(commitRangeValidateDataSchema.safeParse({
+    base: "a".repeat(40), head: "b".repeat(40), commit_count: 128, hook: "commit-msg",
+  }).success, true);
+  assert.equal(commitRangeValidateDataSchema.safeParse({
+    base: "a".repeat(40), head: "b".repeat(40), commit_count: 129, hook: "commit-msg",
+  }).success, false);
   assert.equal(rewordDataSchema.safeParse({
     base: "a".repeat(40), old_head: "b".repeat(40), head: "c".repeat(40), commit_count: 1,
     destination: { mode: "new_branch", branch: "reworded/history", source_branch: "feature/history" },

@@ -573,6 +573,34 @@ test("operation journal preserves validated colon paths and rejects malformed op
   assert.equal(await journal.get("invalid-output"), null);
 });
 
+test("operation journal enforces the bounded commit-range validation result", async (t) => {
+  const paths = await temporaryState(t);
+  const journal = new OperationJournal(paths, { now: () => timestamp, pid: 123 });
+  const valid = { requestId: "range-128", operation: "git_commit_range_validate", repositoryId, input: {} };
+  await journal.begin(valid);
+  const result = {
+    status: "succeeded" as const, request_id: valid.requestId, repository_id: repositoryId,
+    operation: valid.operation, data: {
+      base: objectId, head: "c".repeat(40), commit_count: 128, hook: "commit-msg" as const,
+    }, warnings: [],
+  };
+  await journal.complete(valid.requestId, result);
+  const replay = await journal.begin(valid);
+  assert.equal(replay.kind, "replay");
+
+  const invalid = { requestId: "range-129", operation: "git_commit_range_validate", repositoryId, input: {} };
+  await journal.begin(invalid);
+  await assert.rejects(journal.complete(invalid.requestId, {
+    ...result, request_id: invalid.requestId, data: { ...result.data, commit_count: 129 },
+  }), /output|data|commit_count/i);
+  assert.equal(await journal.get(invalid.requestId), null);
+  await writeFile(join(paths.operations, invalid.requestId, "result.json"), JSON.stringify({
+    requestId: invalid.requestId, completedAt: timestamp,
+    result: { ...result, request_id: invalid.requestId, data: { ...result.data, commit_count: 129 } },
+  }));
+  await assert.rejects(journal.get(invalid.requestId), /output|data|commit_count/i);
+});
+
 test("request-only journal state resumes execution while started state becomes durable indeterminate", async (t) => {
   const paths = await temporaryState(t);
   const journal = new OperationJournal(paths, { now: () => timestamp, pid: 123 });

@@ -7,17 +7,19 @@ import {
   executePreparedCommitRangeValidation,
   inspectLinearCommitRange,
   prepareCommitRangeValidation,
+  validateMessagesWithNativeHook,
 } from "../src/git/history.js";
+import { withDeadline } from "../src/deadline.js";
 import { resolveGitExecutable } from "../src/git/environment.js";
 import { inspectRepository, type RepositorySnapshot } from "../src/git/repository.js";
-import { GitRunner, type GitCommand, type GitCommandResult } from "../src/git/runner.js";
+import { GitRunner, type GitCommand, type GitCommandResult, type GitStreamingCommand } from "../src/git/runner.js";
 import { initializeStatePaths, resolveStatePaths } from "../src/state/paths.js";
 import { SessionStore } from "../src/state/session-store.js";
 import { createBridgeRuntime } from "../src/app/bridge-service.js";
 import type { StatePaths } from "../src/state/paths.js";
 
-async function git(runner: GitRunner, cwd: string, args: readonly string[]): Promise<string> {
-  const result = await runner.run({ cwd, args, timeoutMs: 10_000, maxOutputBytes: 64_000 });
+async function git(runner: GitRunner, cwd: string, args: readonly string[], stdin?: string): Promise<string> {
+  const result = await runner.run({ cwd, args, timeoutMs: 10_000, maxOutputBytes: 64_000, ...(stdin === undefined ? {} : { stdin }) });
   assert.equal(result.exitCode, 0, result.stderr);
   return result.stdout.trim();
 }
@@ -70,11 +72,47 @@ class QueueRunner extends GitRunner {
   constructor(private readonly replies: readonly GitCommandResult[]) { super(process.execPath, process.env); }
   private index = 0;
 
+  get calls(): number { return this.index; }
+
   override async run(): Promise<GitCommandResult> {
     const result = this.replies[this.index++];
     if (result === undefined) throw new Error("Unexpected Git command");
     return result;
   }
+}
+
+class RawRangeRunner extends QueueRunner {
+  constructor(replies: readonly GitCommandResult[], private readonly chunks: readonly Buffer[]) { super(replies); }
+
+  override async runStreaming(_command: GitStreamingCommand, consume: (chunk: Buffer) => void, _signal?: AbortSignal): Promise<GitCommandResult> {
+    for (const chunk of this.chunks) consume(chunk);
+    return commandResult();
+  }
+}
+
+class AbortDuringHookRunner extends TrackingRunner {
+  constructor(executable: string, environment: NodeJS.ProcessEnv, private readonly controller: AbortController) {
+    super(executable, environment);
+  }
+
+  override async run(command: GitCommand, signal?: AbortSignal): Promise<GitCommandResult> {
+    if (command.args[0] === "hook") setTimeout(() => this.controller.abort(), 5_000).unref();
+    return super.run(command, signal);
+  }
+}
+
+class ThrowAfterHookRunner extends TrackingRunner {
+  override async run(command: GitCommand, signal?: AbortSignal): Promise<GitCommandResult> {
+    const result = await super.run(command, signal);
+    if (command.args[0] === "hook") throw new Error("simulated runner failure");
+    return result;
+  }
+}
+
+function assertGenericMutationFailure(error: unknown): true {
+  const result = (error as { result: { error?: unknown } }).result;
+  assert.deepEqual(result.error, { code: "GIT_FAILED", message: "Native commit-msg hook changed the repository" });
+  return true;
 }
 
 function commitObject(tree: string, parent: string): string {
@@ -125,6 +163,77 @@ test("a native hook that changes the worktree or refs cannot validate the range"
       return true;
     });
   }
+});
+
+test("a hook mutation wins over its private rejection and cleans its temporary message", async (t) => {
+  const before = new Set((await readdir(tmpdir())).filter((entry) => entry.startsWith("git-mcp-server-commit-msg-")));
+  const { runner, sessions, base, head } = await fixture(t, "git update-ref refs/heads/hook-mutated HEAD\nprintf 'private reject' >&2\nexit 17");
+  const prepared = await prepareCommitRangeValidation(runner, sessions, head, {
+    expectedBranch: "main", expectedHead: head.head, base,
+  });
+  await assert.rejects(executePreparedCommitRangeValidation(runner, prepared), assertGenericMutationFailure);
+  const after = (await readdir(tmpdir())).filter((entry) => entry.startsWith("git-mcp-server-commit-msg-") && !before.has(entry));
+  assert.deepEqual(after, []);
+});
+
+test("post-hook state proof receives a fresh budget after deadline, caller abort, and runner failure", async (t) => {
+  await t.test("expired operation deadline", async (t) => {
+    const { directory, sessions, base, head } = await fixture(t, "git update-ref refs/heads/hook-mutated HEAD\nsleep 12");
+    const runner = new TrackingRunner(await resolveGitExecutable(), process.env);
+    const prepared = await prepareCommitRangeValidation(runner, sessions, await inspectRepository(runner, directory), {
+      expectedBranch: "main", expectedHead: head.head, base,
+    });
+    await assert.rejects(withDeadline(10_000, undefined, async (signal) =>
+      executePreparedCommitRangeValidation(runner, prepared, signal)), assertGenericMutationFailure);
+    assert.equal(runner.commands.filter(({ args }) => args[0] === "hook").length, 1);
+  });
+
+  await t.test("caller abort", async (t) => {
+    const { directory, sessions, base, head } = await fixture(t, "git update-ref refs/heads/hook-mutated HEAD\nsleep 12");
+    const controller = new AbortController();
+    const runner = new AbortDuringHookRunner(await resolveGitExecutable(), process.env, controller);
+    const prepared = await prepareCommitRangeValidation(runner, sessions, await inspectRepository(runner, directory), {
+      expectedBranch: "main", expectedHead: head.head, base,
+    });
+    await assert.rejects(executePreparedCommitRangeValidation(runner, prepared, controller.signal), assertGenericMutationFailure);
+    assert.equal(runner.commands.filter(({ args }) => args[0] === "hook").length, 1);
+  });
+
+  await t.test("runner failure", async (t) => {
+    const { directory, sessions, base, head } = await fixture(t, "git update-ref refs/heads/hook-mutated HEAD");
+    const runner = new ThrowAfterHookRunner(await resolveGitExecutable(), process.env);
+    const prepared = await prepareCommitRangeValidation(runner, sessions, await inspectRepository(runner, directory), {
+      expectedBranch: "main", expectedHead: head.head, base,
+    });
+    await assert.rejects(executePreparedCommitRangeValidation(runner, prepared), assertGenericMutationFailure);
+    assert.equal(runner.commands.filter(({ args }) => args[0] === "hook").length, 1);
+  });
+});
+
+test("wrapper setup and cleanup failures still run the mandatory proof before another hook", async () => {
+  let proofs = 0;
+  const setupRunner = new QueueRunner([]);
+  await assert.rejects(validateMessagesWithNativeHook(
+    setupRunner, "/repo", "/hooks", ["first", "second"], undefined,
+    async () => { proofs += 1; },
+    async () => { throw new Error("simulated wrapper setup failure"); },
+  ), /setup failure/);
+  assert.equal(proofs, 1);
+  assert.equal(setupRunner.calls, 0);
+
+  const cleanupRunner = new QueueRunner([commandResult()]);
+  let cleanupCalls = 0;
+  await assert.rejects(validateMessagesWithNativeHook(
+    cleanupRunner, "/repo", "/hooks", ["first", "second"], undefined,
+    async () => { proofs += 1; },
+    async () => ({
+      directory: "/private/wrappers", failureConsumer: () => {}, rejectedHook: () => undefined,
+      cleanup: async () => { cleanupCalls += 1; throw new Error("simulated wrapper cleanup failure"); },
+    }),
+  ), /cleanup failure/);
+  assert.equal(proofs, 2);
+  assert.equal(cleanupCalls, 1);
+  assert.equal(cleanupRunner.calls, 1);
 });
 
 test("a mutation after the first message stops validation before the second hook can restore or reject", async (t) => {
@@ -181,6 +290,26 @@ test("range parser accepts only NUL-framed exact same-width IDs and the 128-comm
   const overflowRange = overflow.map((id, index) => `${index === 0 ? "" : "\n"}${id}\0${index === 0 ? base : overflow[index - 1]}\0`).join("") + "\n";
   await assert.rejects(inspectLinearCommitRange(new QueueRunner([commandResult(), commandResult({ stdout: overflowRange })]), "/repo", base, overflow.at(-1)!),
     /range|maximum|malformed/i);
+});
+
+test("range parser rejects raw invalid UTF-8 and accepts a complete 64-bit object-id family", async () => {
+  const base64 = "a".repeat(64);
+  const head64 = "b".repeat(64);
+  const valid64 = `${head64}\0${base64}\0\n`;
+  const accepted = await inspectLinearCommitRange(new QueueRunner([
+    commandResult(), commandResult({ stdout: valid64 }), commandResult({ stdout: commitObject("c".repeat(64), base64) }),
+  ]), "/repo", base64, head64);
+  assert.equal(accepted[0]?.commit, head64);
+
+  await assert.rejects(inspectLinearCommitRange(new RawRangeRunner([commandResult()], [
+    Buffer.concat([Buffer.from(`${head64}\0${base64}\0`), Buffer.from([0xff]), Buffer.from("\n")]),
+  ]), "/repo", base64, head64), /range|object|malformed/i);
+  const base = "a".repeat(40);
+  const head = "b".repeat(40);
+  await assert.rejects(inspectLinearCommitRange(new QueueRunner([
+    commandResult(), commandResult({ stdout: `${head}\0${base}\0\n` }),
+    commandResult({ stdout: `${commitObject("c".repeat(40), base)}\uFFFD` }),
+  ]), "/repo", base, head), /UTF-8|metadata|object/i);
 });
 
 test("range parser rejects malformed IDs, records, UTF-8, and commit metadata before hooks", async () => {
@@ -244,6 +373,56 @@ test("dirty, detached, in-progress, active-session, and moved state reject befor
   }
 });
 
+test("branch/reference movement and real merge or signed objects reject before hooks", async (t) => {
+  await t.test("named branch and base anchor movement", async (t) => {
+    const { directory, runner, sessions, base, head } = await fixture(t, "git update-ref refs/heads/base-anchor HEAD");
+    await git(runner, directory, ["update-ref", "refs/heads/base-anchor", base]);
+    const tracked = new TrackingRunner(await resolveGitExecutable(), process.env);
+    const prepared = await prepareCommitRangeValidation(tracked, sessions, await inspectRepository(tracked, directory), {
+      expectedBranch: "main", expectedHead: head.head, base,
+    });
+    await assert.rejects(executePreparedCommitRangeValidation(tracked, prepared), assertGenericMutationFailure);
+    assert.equal(tracked.commands.filter(({ args }) => args[0] === "hook").length, 1);
+  });
+
+  await t.test("actual merge commit", async (t) => {
+    const { directory, runner, sessions, base } = await fixture(t, "exit 0");
+    await git(runner, directory, ["switch", "-c", "side"]);
+    await writeFile(join(directory, "side.txt"), "side\n");
+    await git(runner, directory, ["add", "--", "side.txt"]);
+    await git(runner, directory, ["commit", "--no-gpg-sign", "-m", "feat(side): commit"]);
+    await git(runner, directory, ["switch", "main"]);
+    await writeFile(join(directory, "main.txt"), "main\n");
+    await git(runner, directory, ["add", "--", "main.txt"]);
+    await git(runner, directory, ["commit", "--no-gpg-sign", "-m", "feat(main): commit"]);
+    await git(runner, directory, ["merge", "--no-ff", "--no-gpg-sign", "side", "-m", "merge side"]);
+    const current = await inspectRepository(runner, directory);
+    const tracked = new TrackingRunner(await resolveGitExecutable(), process.env);
+    await assert.rejects(prepareCommitRangeValidation(tracked, sessions, current, {
+      expectedBranch: "main", expectedHead: current.head, base,
+    }), /parent|linear|range|metadata/i);
+    assert.equal(tracked.commands.filter(({ args }) => args[0] === "hook").length, 0);
+  });
+
+  await t.test("actual signed-header commit object", async (t) => {
+    const { directory, runner, sessions, base, head } = await fixture(t, "exit 0");
+    const tree = await git(runner, directory, ["rev-parse", "HEAD^{tree}"]);
+    const object = [
+      `tree ${tree}`, `parent ${head.head}`,
+      "author Test <test@example.test> 0 +0000", "committer Test <test@example.test> 0 +0000",
+      "gpgsig fake-signature", " continuation", "", "feat(signed): rejected", "",
+    ].join("\n");
+    const signed = await git(runner, directory, ["hash-object", "-t", "commit", "-w", "--stdin"], object);
+    await git(runner, directory, ["update-ref", "refs/heads/main", signed, head.head]);
+    const current = await inspectRepository(runner, directory);
+    const tracked = new TrackingRunner(await resolveGitExecutable(), process.env);
+    await assert.rejects(prepareCommitRangeValidation(tracked, sessions, current, {
+      expectedBranch: "main", expectedHead: signed, base,
+    }), /metadata|unsupported|parent/i);
+    assert.equal(tracked.commands.filter(({ args }) => args[0] === "hook").length, 0);
+  });
+});
+
 test("service persists only the redacted hook failure and replays it by exact request identity", async (t) => {
   const secret = "range-hook-secret-9f8a";
   const { directory, paths, base, head } = await fixture(t, `printf '${secret}\\n'\nprintf '${secret}\\n' >&2\nexit 17`);
@@ -264,4 +443,29 @@ test("service persists only the redacted hook failure and replays it by exact re
   assert.deepEqual(await runtime.service.git_commit_range_validate(input), result);
   const reused = await runtime.service.git_commit_range_validate({ ...input, base: "a".repeat(40) });
   assert.equal(reused.error?.code, "REQUEST_ID_REUSED");
+});
+
+test("service durably replays the generic mutation-precedence failure without private hook details", async (t) => {
+  const secret = "range-mutation-secret-13c2";
+  const { directory, paths, base, head } = await fixture(t, `git update-ref refs/heads/hook-mutated HEAD\nprintf '${secret} stdout\\n'\nprintf '${secret} stderr\\n' >&2\nexit 17`);
+  const runtime = await createBridgeRuntime(paths);
+  const input = {
+    repository: directory, request_id: "b2326b9a-5e56-4d1b-b1e2-2d6f27602223",
+    expected_branch: "main", expected_head: head.head, base,
+  };
+  const result = await runtime.service.git_commit_range_validate(input);
+  assert.equal(result.status, "failed");
+  assert.equal(result.request_id, input.request_id);
+  assert.equal(result.repository_id, head.repositoryId);
+  assert.equal(result.operation, "git_commit_range_validate");
+  assert.deepEqual(result.warnings, []);
+  assert.deepEqual(result.error, { code: "GIT_FAILED", message: "Native commit-msg hook changed the repository" });
+  const stored = await runtime.journal.get(input.request_id);
+  assert.deepEqual(stored?.result, result);
+  assert.deepEqual(await runtime.service.git_commit_range_validate(input), result);
+  const reused = await runtime.service.git_commit_range_validate({ ...input, base: "a".repeat(40) });
+  assert.equal(reused.error?.code, "REQUEST_ID_REUSED");
+  const encoded = JSON.stringify({ result, stored, reused });
+  assert.doesNotMatch(encoded, new RegExp(`${secret}|stdout|stderr|exit|git-mcp-server-commit-msg-|hook-mutated|feat\\(first\\)|fix\\(second\\)`, "i"));
+  assert.equal(result.error?.details, undefined);
 });
