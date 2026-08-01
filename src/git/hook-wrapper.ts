@@ -23,6 +23,11 @@ export interface HookWrapperSet {
   cleanup(): Promise<void>;
 }
 
+export interface PushHookAdapter {
+  readonly directory: string;
+  cleanup(): Promise<void>;
+}
+
 /** Creates a private, permission-restricted commit message file for `git hook run`. */
 export async function withNativeCommitMessageFile<T>(
   message: string,
@@ -49,7 +54,7 @@ function wrapperScript(original: string, hook: string): string {
     : "";
   return [
     "#!/bin/sh",
-    "unset GIT_CONFIG_COUNT GIT_CONFIG_KEY_0 GIT_CONFIG_VALUE_0",
+    "unset GIT_CONFIG_COUNT GIT_CONFIG_KEY_0 GIT_CONFIG_VALUE_0 GIT_MCP_PREPARED_PUSH_ENDPOINT",
     `if [ ! -x ${shellQuote(original)} ]; then exit 0; fi`,
     "status=0",
     `${shellQuote(original)} "$@" 3>&- || status=$?`,
@@ -57,6 +62,18 @@ function wrapperScript(original: string, hook: string): string {
     'exit "$status"',
     "",
   ].filter((line, index, lines) => line !== "" || index === lines.length - 1).join("\n");
+}
+
+function pushAdapterScript(original: string): string {
+  return [
+    "#!/bin/sh",
+    'if [ "${GIT_MCP_PREPARED_PUSH_ENDPOINT+x}" != "x" ]; then exit 1; fi',
+    "endpoint=$GIT_MCP_PREPARED_PUSH_ENDPOINT",
+    "unset GIT_CONFIG_COUNT GIT_CONFIG_KEY_0 GIT_CONFIG_VALUE_0 GIT_MCP_PREPARED_PUSH_ENDPOINT",
+    `if [ ! -x ${shellQuote(original)} ]; then exit 0; fi`,
+    `exec ${shellQuote(original)} origin "$endpoint" 3>&-`,
+    "",
+  ].join("\n");
 }
 
 class FailureChannel {
@@ -111,6 +128,25 @@ export async function createHookWrappers(originalHooksDirectory: string): Promis
     directory,
     failureConsumer: (chunk) => channel.consume(chunk),
     rejectedHook: () => channel.rejectedHook(),
+    cleanup: async () => rm(directory, { recursive: true, force: true }),
+  };
+}
+
+/** Creates the one Git-invoked adapter that preserves named-origin pre-push hook semantics. */
+export async function createPushHookAdapter(originalHooksDirectory: string): Promise<PushHookAdapter> {
+  const directory = await mkdtemp(join(tmpdir(), "git-mcp-server-push-hook-"));
+  try {
+    await chmod(directory, 0o700);
+    await writeFile(join(directory, "pre-push"), pushAdapterScript(join(originalHooksDirectory, "pre-push")), {
+      encoding: "utf8",
+      mode: 0o700,
+    });
+  } catch (error) {
+    await rm(directory, { recursive: true, force: true });
+    throw error;
+  }
+  return {
+    directory,
     cleanup: async () => rm(directory, { recursive: true, force: true }),
   };
 }

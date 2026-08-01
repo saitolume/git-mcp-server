@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { access, chmod, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { access, chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { delimiter, join } from "node:path";
 import test from "node:test";
@@ -381,6 +381,15 @@ test("force-with-lease uses only the prepared endpoint when origin and pushurl c
   await git(f.runner, f.local, ["push", "origin", "main"]);
   const approved = await commit(f.runner, f.local, "approved-endpoint.txt", "approved endpoint\n");
   const local = await inspectRepository(f.runner, f.local);
+  const hookCapture = join(f.root, "force-hook-capture");
+  await hook(f.local, [
+    'test -z "${GIT_CONFIG_COUNT:-}"',
+    'test -z "${GIT_CONFIG_KEY_0:-}"',
+    'test -z "${GIT_CONFIG_VALUE_0:-}"',
+    'test -z "${GIT_MCP_PREPARED_PUSH_ENDPOINT:-}"',
+    `printf '%s\\n%s\\n' "$1" "$2" >> ${JSON.stringify(hookCapture)}`,
+    `cat >> ${JSON.stringify(hookCapture)}`,
+  ].join("\n"));
   const statePaths = await initializeStatePaths(resolveStatePaths({
     platform: "linux", homedir: join(f.root, "endpoint-race-state"), env: {},
   }));
@@ -402,6 +411,53 @@ test("force-with-lease uses only the prepared endpoint when origin and pushurl c
   assert.equal(await git(f.runner, f.bare, ["rev-parse", "refs/heads/main"]), approved);
   assert.equal(await hasRef(f.bootstrap, f.redirectedBare, "refs/heads/main"), false);
   await assert.rejects(access(f.redirectedContact));
+  assert.equal(await readFile(hookCapture, "utf8"), [
+    "origin",
+    f.origin,
+    `${approved} ${approved} refs/heads/main ${f.initial.head}`,
+    "",
+  ].join("\n"));
+  assert.deepEqual(runner.commands[0]?.args, [
+    "push",
+    `--force-with-lease=refs/heads/main:${f.initial.head}`,
+    f.origin,
+    `${approved}:refs/heads/main`,
+  ]);
+});
+
+test("push origin preserves its named hook contract when origin and pushurl change before Git starts", async (t) => {
+  const f = await fixture(t, { withRedirectedEndpoint: true });
+  await git(f.runner, f.local, ["push", "origin", "main"]);
+  const approved = await commit(f.runner, f.local, "normal-approved-endpoint.txt", "normal approved endpoint\n");
+  const local = await inspectRepository(f.runner, f.local);
+  const hookCapture = join(f.root, "normal-hook-capture");
+  await hook(f.local, [
+    'test -z "${GIT_CONFIG_COUNT:-}"',
+    'test -z "${GIT_CONFIG_KEY_0:-}"',
+    'test -z "${GIT_CONFIG_VALUE_0:-}"',
+    'test -z "${GIT_MCP_PREPARED_PUSH_ENDPOINT:-}"',
+    `printf '%s\\n%s\\n' "$1" "$2" >> ${JSON.stringify(hookCapture)}`,
+    `cat >> ${JSON.stringify(hookCapture)}`,
+  ].join("\n"));
+  const prepared = await preparePushOrigin(f.runner, local, request(local, f.initial.head));
+  const runner = new BeforePushActionRunner(f.runner, async () => {
+    await git(f.runner, f.local, ["remote", "set-url", "origin", f.redirectedOrigin]);
+    await git(f.runner, f.local, ["remote", "set-url", "--push", "origin", f.redirectedOrigin]);
+  });
+
+  let caught: unknown;
+  try { await executePreparedPush(runner, prepared); } catch (error) { caught = error; }
+
+  assert.equal(proven(caught).result.status, "indeterminate");
+  assert.equal(await git(f.runner, f.bare, ["rev-parse", "refs/heads/main"]), approved);
+  assert.equal(await hasRef(f.bootstrap, f.redirectedBare, "refs/heads/main"), false);
+  await assert.rejects(access(f.redirectedContact));
+  assert.equal(await readFile(hookCapture, "utf8"), [
+    "origin",
+    f.origin,
+    `${approved} ${approved} refs/heads/main ${f.initial.head}`,
+    "",
+  ].join("\n"));
   assert.deepEqual(runner.commands[0]?.args, [
     "push",
     `--force-with-lease=refs/heads/main:${f.initial.head}`,
@@ -572,7 +628,12 @@ test("force-with-lease runs native pre-push hooks and redacts rejection diagnost
   const oldRemoteHead = f.initial.head;
   await commit(f.runner, f.local, "next.txt", "next\n");
   const local = await inspectRepository(f.runner, f.local);
-  await hook(f.local, 'echo "credential=https://secret.example/token private-hook-path" >&2\nexit 1');
+  await hook(f.local, [
+    'test "$1" = "origin"',
+    `test "$2" = ${JSON.stringify(f.origin)}`,
+    'echo "credential=https://secret.example/token private-hook-path" >&2',
+    "exit 1",
+  ].join("\n"));
   const statePaths = await initializeStatePaths(resolveStatePaths({
     platform: "linux", homedir: join(f.root, "hook-state"), env: {},
   }));
@@ -901,7 +962,12 @@ test("push origin lease rejects an expected-absence collision after preparation"
 test("push origin reports pre-push rejection and transport failure only after proving the remote unchanged", async (t) => {
   await t.test("pre-push hook", async (t) => {
     const f = await fixture(t);
-    await hook(f.local, 'echo "private hook diagnostic" >&2\nexit 1');
+    await hook(f.local, [
+      'test "$1" = "origin"',
+      `test "$2" = ${JSON.stringify(f.origin)}`,
+      'echo "private hook diagnostic" >&2',
+      "exit 1",
+    ].join("\n"));
     const prepared = await preparePushOrigin(f.runner, f.initial, request(f.initial, null));
     let caught: unknown;
     try { await executePreparedPush(f.runner, prepared); } catch (error) { caught = error; }

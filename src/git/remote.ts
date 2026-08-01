@@ -10,6 +10,8 @@ import { validateOriginRemoteRef, type FetchRecord } from "../state/records.js";
 import type { SessionStore } from "../state/session-store.js";
 import { assertMutationReady, canonicalBranchRef, inspectRepository, validateFullRef, type RepositorySnapshot } from "./repository.js";
 import { readPushTrackedWorktreeSnapshotId, readStatusWithWorktreeContentProof } from "./read.js";
+import { readHooksPath } from "./commit.js";
+import { createPushHookAdapter } from "./hook-wrapper.js";
 import type { GitCommandResult, GitRunner } from "./runner.js";
 import {
   COMPLETE_RECORD_MAX_BYTES,
@@ -115,6 +117,7 @@ interface PreparedPushState {
   readonly worktreeContentSnapshotId?: string;
   readonly remoteIdentity: string;
   readonly rawEndpoint: string;
+  readonly hooksPath: string;
   readonly remoteHead: string | null;
   readonly pushPolicyHash: string;
 }
@@ -878,6 +881,7 @@ export async function preparePushOrigin(
   const canonicalRef = pushBranchRef(before.branch!);
   if (before.branchRef !== canonicalRef) pushRejected("INVALID_INPUT", "Push branch ref is invalid");
   const trackedSnapshotId = await readPushTrackedWorktreeSnapshotId(runner, before, signal);
+  const hooksPath = await readHooksPath(runner, before.root, signal);
   const policy = await readPushPolicy(runner, before.root, signal);
   const remoteHead = await readRemoteBranchHead(runner, before, before.branch!, signal);
   assertExpectedRemoteHead(input.expectedRemoteHead, remoteHead);
@@ -893,6 +897,8 @@ export async function preparePushOrigin(
   if (finalTrackedSnapshotId !== trackedSnapshotId) {
     pushRejected("INDEX_MISMATCH", "Local repository state changed while preparing push");
   }
+  const finalHooksPath = await readHooksPath(runner, finalBefore.root, signal);
+  if (finalHooksPath !== hooksPath) pushPolicyRejected();
   const finalPolicy = await readPushPolicy(runner, finalBefore.root, signal);
   if (finalPolicy.hash !== policy.hash || finalPolicy.rawEndpoint !== policy.rawEndpoint
     || !sameRemoteIdentity(finalPolicy.remote, policy.remote)) pushPolicyRejected();
@@ -909,6 +915,7 @@ export async function preparePushOrigin(
     worktreeSnapshotId: finalTrackedSnapshotId,
     remoteIdentity,
     rawEndpoint: finalPolicy.rawEndpoint,
+    hooksPath: finalHooksPath,
     remoteHead: finalRemoteHead,
     pushPolicyHash: finalPolicy.hash,
   });
@@ -952,6 +959,7 @@ export async function prepareForcePushOrigin(
   const canonicalRef = pushBranchRef(before.branch!);
   if (before.branchRef !== canonicalRef) pushRejected("INVALID_INPUT", "Push branch ref is invalid");
   const worktree = await readStatusWithWorktreeContentProof(runner, before, [], signal);
+  const hooksPath = await readHooksPath(runner, before.root, signal);
   const policy = await readPushPolicy(runner, before.root, signal);
   const remoteHead = await readRemoteBranchHead(runner, before, before.branch!, signal);
   assertExpectedRemoteHead(input.expectedRemoteHead, remoteHead);
@@ -974,6 +982,8 @@ export async function prepareForcePushOrigin(
     || finalWorktree.contentProof.paths.join("\0") !== worktree.contentProof.paths.join("\0")) {
     pushRejected("INDEX_MISMATCH", "Local repository state changed while preparing push");
   }
+  const finalHooksPath = await readHooksPath(runner, finalBefore.root, signal);
+  if (finalHooksPath !== hooksPath) pushPolicyRejected();
   const finalPolicy = await readPushPolicy(runner, finalBefore.root, signal);
   if (finalPolicy.hash !== policy.hash || finalPolicy.rawEndpoint !== policy.rawEndpoint
     || !sameRemoteIdentity(finalPolicy.remote, policy.remote)) pushPolicyRejected();
@@ -991,6 +1001,7 @@ export async function prepareForcePushOrigin(
     worktreeContentSnapshotId: finalWorktree.contentProof.snapshotId,
     remoteIdentity,
     rawEndpoint: finalPolicy.rawEndpoint,
+    hooksPath: finalHooksPath,
     remoteHead: finalRemoteHead,
     pushPolicyHash: finalPolicy.hash,
   });
@@ -1056,7 +1067,9 @@ async function executePreparedPushState(
   signal?: AbortSignal,
 ): Promise<PushExecutionOutcome> {
   let command: GitCommandResult | undefined;
+  let hookAdapter: Awaited<ReturnType<typeof createPushHookAdapter>> | undefined;
   try {
+    hookAdapter = await createPushHookAdapter(state.hooksPath);
     command = await runner.run({
       cwd: state.snapshot.root,
       args: [
@@ -1067,9 +1080,17 @@ async function executePreparedPushState(
       ],
       timeoutMs: remainingDeadlineTimeoutMs(OPERATION_TIMEOUT_MS.remote),
       maxOutputBytes: READ_OUTPUT_LIMIT,
+      hookExecution: {
+        wrappersDirectory: hookAdapter.directory,
+        failureConsumer: () => undefined,
+        prePushEndpoint: state.rawEndpoint,
+      },
     }, signal);
   } catch {
     command = undefined;
+  } finally {
+    try { await hookAdapter?.cleanup(); }
+    catch { /* The adapter contains no endpoint and cleanup cannot alter the Git outcome. */ }
   }
 
   return withReconciliationDeadline(async () => {
@@ -1077,6 +1098,7 @@ async function executePreparedPushState(
   let worktreeSnapshotAfter: string;
   let worktreeContentSnapshotAfter: string | undefined;
   let worktreePathsAfter: readonly string[] | undefined;
+  let hooksPathAfter: string;
   let policyAfter: PushPolicyProof;
   let remoteHeadAfter: string | null;
   try {
@@ -1089,13 +1111,17 @@ async function executePreparedPushState(
       worktreeContentSnapshotAfter = worktree.contentProof.snapshotId;
       worktreePathsAfter = worktree.contentProof.paths;
     }
+    hooksPathAfter = await readHooksPath(runner, after.root);
+    if (hooksPathAfter !== state.hooksPath) pushIndeterminate(operation);
     policyAfter = await readPushPolicy(runner, after.root);
     if (policyAfter.hash !== state.pushPolicyHash || policyAfter.rawEndpoint !== state.rawEndpoint
       || remoteIdentityString(policyAfter.remote) !== state.remoteIdentity) pushIndeterminate(operation);
     remoteHeadAfter = await readRemoteBranchHeadFrom(runner, after, after.branch!, state.rawEndpoint);
     const finalPolicy = await readPushPolicy(runner, after.root);
+    const finalHooksPath = await readHooksPath(runner, after.root);
     if (policyAfter.hash !== finalPolicy.hash || policyAfter.rawEndpoint !== finalPolicy.rawEndpoint
-      || !sameRemoteIdentity(policyAfter.remote, finalPolicy.remote)) pushIndeterminate(operation);
+      || !sameRemoteIdentity(policyAfter.remote, finalPolicy.remote)
+      || finalHooksPath !== hooksPathAfter) pushIndeterminate(operation);
   } catch (error) {
     if (error instanceof ProvenMutationOutcome) throw error;
     pushIndeterminate(operation);
@@ -1106,6 +1132,7 @@ async function executePreparedPushState(
     || (state.worktreeProof === "complete"
       && (worktreeContentSnapshotAfter !== state.worktreeContentSnapshotId
         || worktreePathsAfter?.join("\0") !== state.worktreePaths?.join("\0")))
+    || hooksPathAfter! !== state.hooksPath
     || policyAfter!.hash !== state.pushPolicyHash
     || policyAfter!.rawEndpoint !== state.rawEndpoint
     || remoteIdentityString(policyAfter!.remote) !== state.remoteIdentity) {

@@ -27,6 +27,8 @@ export interface GitCommand {
   readonly hookExecution?: {
     readonly wrappersDirectory: string;
     readonly failureConsumer: (chunk: Buffer) => void;
+    /** Internal-only endpoint passed to the Git-invoked pre-push adapter. */
+    readonly prePushEndpoint?: string;
   };
 }
 
@@ -154,6 +156,12 @@ export class GitRunner {
           GIT_CONFIG_COUNT: "1",
           GIT_CONFIG_KEY_0: "core.hooksPath",
           GIT_CONFIG_VALUE_0: command.hookExecution.wrappersDirectory,
+          ...(command.hookExecution.prePushEndpoint === undefined ? {} : {
+            GIT_MCP_PREPARED_PUSH_ENDPOINT: assertWellFormedGitText(
+              command.hookExecution.prePushEndpoint,
+              "Prepared push endpoint",
+            ),
+          }),
         },
       shell: false,
       detached: process.platform !== "win32",
