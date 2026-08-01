@@ -9,7 +9,7 @@ export const absoluteRepositoryPath = gitTransportText.min(1).refine(
   (value) => value.startsWith("/"),
   "repository must be absolute",
 ).describe("Absolute filesystem path to the target Git worktree; it must start with '/'.");
-export const objectId = z.string().regex(/^[0-9a-f]{40,64}$/)
+export const objectId = z.string().regex(/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/)
   .describe("Full lowercase 40- or 64-hex Git object ID.");
 export const requestId = z.uuid()
   .describe("Client-generated UUID used as the durable idempotency and replay identity.");
@@ -163,7 +163,10 @@ export const gitPushInput = z.strictObject({
 export const gitCommitRangeValidateInput = z.strictObject({
   ...mutationBase,
   base: objectId.describe("Exact base commit object ID for the guarded reachable commit range."),
-});
+}).refine(
+  ({ base, expected_head }) => base.length === expected_head.length,
+  "base and expected_head must use the same object ID width",
+);
 
 export const gitRewordInput = z.strictObject({
   ...mutationBase,

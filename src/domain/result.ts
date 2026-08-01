@@ -229,7 +229,10 @@ export const commitRangeValidateDataSchema = z.strictObject({
   head: objectId,
   commit_count: z.number().int().min(1).max(128),
   hook: z.literal("commit-msg"),
-});
+}).refine(
+  ({ base, head }) => base.length === head.length,
+  "base and head must use the same object ID width",
+);
 
 export const rewordDataSchema = z.strictObject({
   base: objectId,

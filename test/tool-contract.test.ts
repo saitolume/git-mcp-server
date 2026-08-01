@@ -232,6 +232,16 @@ test("guarded history inputs accept only their published wire contracts", () => 
     ...base,
     base: "a".repeat(40),
   }).success, true);
+  for (const width of [39, 40, 41, 63, 64, 65]) {
+    assert.equal(gitCommitRangeValidateInput.safeParse({
+      ...base, expected_head: "b".repeat(width), base: "a".repeat(width),
+    }).success, width === 40 || width === 64, `range input width ${width}`);
+  }
+  for (const [baseWidth, headWidth] of [[40, 64], [64, 40]] as const) {
+    assert.equal(gitCommitRangeValidateInput.safeParse({
+      ...base, expected_head: "b".repeat(headWidth), base: "a".repeat(baseWidth),
+    }).success, false, `mixed range input ${baseWidth}/${headWidth}`);
+  }
   assert.equal(gitRewordInput.safeParse({
     ...base,
     base: "a".repeat(40),
@@ -275,6 +285,16 @@ test("guarded history result schemas expose only the published payloads", () => 
   assert.equal(commitRangeValidateDataSchema.safeParse({
     base: "a".repeat(40), head: "b".repeat(40), commit_count: 129, hook: "commit-msg",
   }).success, false);
+  for (const width of [39, 40, 41, 63, 64, 65]) {
+    assert.equal(commitRangeValidateDataSchema.safeParse({
+      base: "a".repeat(width), head: "b".repeat(width), commit_count: 1, hook: "commit-msg",
+    }).success, width === 40 || width === 64, `range output width ${width}`);
+  }
+  for (const [baseWidth, headWidth] of [[40, 64], [64, 40]] as const) {
+    assert.equal(commitRangeValidateDataSchema.safeParse({
+      base: "a".repeat(baseWidth), head: "b".repeat(headWidth), commit_count: 1, hook: "commit-msg",
+    }).success, false, `mixed range output ${baseWidth}/${headWidth}`);
+  }
   assert.equal(rewordDataSchema.safeParse({
     base: "a".repeat(40), old_head: "b".repeat(40), head: "c".repeat(40), commit_count: 1,
     destination: { mode: "new_branch", branch: "reworded/history", source_branch: "feature/history" },

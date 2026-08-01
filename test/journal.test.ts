@@ -599,6 +599,25 @@ test("operation journal enforces the bounded commit-range validation result", as
     result: { ...result, request_id: invalid.requestId, data: { ...result.data, commit_count: 129 } },
   }));
   await assert.rejects(journal.get(invalid.requestId), /output|data|commit_count/i);
+
+  for (const [name, base, head] of [
+    ["non-exact-base", "a".repeat(41), "c".repeat(40)],
+    ["non-exact-head", objectId, "c".repeat(63)],
+    ["mixed-40-64", objectId, "c".repeat(64)],
+    ["mixed-64-40", "a".repeat(64), "c".repeat(40)],
+  ] as const) {
+    const malformed = { requestId: `range-${name}`, operation: "git_commit_range_validate", repositoryId, input: {} };
+    await journal.begin(malformed);
+    const malformedResult = {
+      ...result, request_id: malformed.requestId, data: { ...result.data, base, head },
+    };
+    await assert.rejects(journal.complete(malformed.requestId, malformedResult), /output|data|base|head/i, name);
+    assert.equal(await journal.get(malformed.requestId), null, name);
+    await writeFile(join(paths.operations, malformed.requestId, "result.json"), JSON.stringify({
+      requestId: malformed.requestId, completedAt: timestamp, result: malformedResult,
+    }));
+    await assert.rejects(journal.get(malformed.requestId), /output|data|base|head/i, name);
+  }
 });
 
 test("request-only journal state resumes execution while started state becomes durable indeterminate", async (t) => {
