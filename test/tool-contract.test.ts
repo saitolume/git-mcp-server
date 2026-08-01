@@ -2,14 +2,18 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { z } from "zod";
 import {
-  absoluteRepositoryPath, gitAddInput, gitOutputPath, gitPushInput, gitRestoreWorktreeInput,
-  gitSwitchCreateInput, originRemoteRef, relativeGitPath,
+  absoluteRepositoryPath, gitAddInput, gitCommitAmendInput, gitCommitRangeValidateInput,
+  gitOutputPath, gitPushForceWithLeaseInput, gitPushInput, gitRestoreWorktreeInput,
+  gitRewordInput, gitSwitchCreateInput, localBranchName, originRemoteRef, relativeGitPath,
 } from "../src/domain/inputs.js";
 import { redactDiagnostic } from "../src/domain/redaction.js";
 import {
   BRIDGE_ERROR_CODES,
   bridgeResultSchema,
+  commitAmendDataSchema,
   commitDataSchema,
+  commitRangeValidateDataSchema,
+  rewordDataSchema,
   statusDataSchema,
   switchCreateDataSchema,
 } from "../src/domain/result.js";
@@ -212,6 +216,70 @@ test("mutation schemas reject unknown fields and unsafe paths", () => {
     repository: "/repo", request_id: "018f47d2-7b2a-7d75-b9dd-5ea8abca0005",
     expected_branch: "main", expected_head: "a".repeat(40), paths: ["src/index.ts"],
     stage_id: "stage", merge_session_id: "merge",
+  }).success, false);
+});
+
+test("guarded history inputs accept only their published wire contracts", () => {
+  const base = {
+    repository: "/repo",
+    request_id: "018f47d2-7b2a-7d75-b9dd-5ea8abca0100",
+    expected_branch: "feature/history",
+    expected_head: "b".repeat(40),
+  };
+  assert.equal(gitCommitRangeValidateInput.safeParse({
+    ...base,
+    base: "a".repeat(40),
+  }).success, true);
+  assert.equal(gitRewordInput.safeParse({
+    ...base,
+    base: "a".repeat(40),
+    commits: [{ commit: "b".repeat(40), message: "feat(scope): valid" }],
+    destination: { mode: "current_branch" },
+  }).success, true);
+  assert.equal(gitRewordInput.safeParse({
+    ...base,
+    base: "a".repeat(40),
+    commits: [],
+    destination: { mode: "new_branch", branch: "refs/heads/raw" },
+  }).success, false);
+  assert.equal(gitCommitAmendInput.safeParse({
+    ...base,
+    stage_id: "stage-1",
+    worktree_snapshot_id: "c".repeat(64),
+    message: "fix: amend safely",
+  }).success, true);
+  assert.equal(gitPushForceWithLeaseInput.safeParse({
+    ...base,
+    expected_remote_head: null,
+  }).success, true);
+  for (const branch of ["HEAD", "refs/heads/raw", "topic..bad", "topic/.lock", "topic/�"]) {
+    assert.equal(localBranchName.safeParse(branch).success, false, branch);
+  }
+  assert.equal(gitRewordInput.safeParse({
+    ...base,
+    base: "a".repeat(40),
+    commits: [{ commit: "b".repeat(40), message: "feat: valid", extra: true }],
+    destination: { mode: "current_branch" },
+  }).success, false);
+});
+
+test("guarded history result schemas expose only the published payloads", () => {
+  assert.equal(commitRangeValidateDataSchema.safeParse({
+    base: "a".repeat(40), head: "b".repeat(40), commit_count: 1, hook: "commit-msg",
+  }).success, true);
+  assert.equal(rewordDataSchema.safeParse({
+    base: "a".repeat(40), old_head: "b".repeat(40), head: "c".repeat(40), commit_count: 1,
+    destination: { mode: "new_branch", branch: "reworded/history", source_branch: "feature/history" },
+    trees_unchanged: true, hook: "commit-msg", signing: "disabled_by_policy",
+  }).success, true);
+  assert.equal(commitAmendDataSchema.safeParse({
+    old_commit: "a".repeat(40), commit: "b".repeat(40), old_tree: "c".repeat(40), tree: "d".repeat(40),
+    hook_changed_paths: ["src/index.ts"], signing: "disabled_by_policy",
+  }).success, true);
+  assert.equal(rewordDataSchema.safeParse({
+    base: "a".repeat(40), old_head: "b".repeat(40), head: "c".repeat(40), commit_count: 1,
+    destination: { mode: "current_branch", branch: "feature/history" },
+    trees_unchanged: true, hook: "commit-msg", signing: "disabled_by_policy", message: "must not leak",
   }).success, false);
 });
 

@@ -9,6 +9,7 @@ import {
   absoluteRepositoryPath,
   gitOutputPath,
   gitTransportText,
+  localBranchName,
   objectId,
   originRemoteRef,
   relativeGitPath,
@@ -223,6 +224,36 @@ export const pushDataSchema = z.strictObject({
   remote_head: objectId,
 });
 
+export const commitRangeValidateDataSchema = z.strictObject({
+  base: objectId,
+  head: objectId,
+  commit_count: z.number().int().min(1),
+  hook: z.literal("commit-msg"),
+});
+
+export const rewordDataSchema = z.strictObject({
+  base: objectId,
+  old_head: objectId,
+  head: objectId,
+  commit_count: z.number().int().min(1).max(128),
+  destination: z.discriminatedUnion("mode", [
+    z.strictObject({ mode: z.literal("current_branch"), branch: localBranchName }),
+    z.strictObject({ mode: z.literal("new_branch"), branch: localBranchName, source_branch: localBranchName }),
+  ]),
+  trees_unchanged: z.literal(true),
+  hook: z.literal("commit-msg"),
+  signing: z.literal("disabled_by_policy"),
+});
+
+export const commitAmendDataSchema = z.strictObject({
+  old_commit: objectId,
+  commit: objectId,
+  old_tree: objectId,
+  tree: objectId,
+  hook_changed_paths: returnedGitOutputPaths,
+  signing: z.literal("disabled_by_policy"),
+});
+
 const operationDataSchemas: Readonly<Record<string, z.ZodType>> = {
   git_status: statusDataSchema,
   git_diff: diffDataSchema,
@@ -261,4 +292,7 @@ export type MergeData = z.infer<typeof mergeDataSchema>;
 export type MergeContinueData = z.infer<typeof mergeContinueDataSchema>;
 export type MergeAbortData = z.infer<typeof mergeAbortDataSchema>;
 export type PushData = z.infer<typeof pushDataSchema>;
+export type CommitRangeValidateData = z.infer<typeof commitRangeValidateDataSchema>;
+export type RewordData = z.infer<typeof rewordDataSchema>;
+export type CommitAmendData = z.infer<typeof commitAmendDataSchema>;
 export type StatusEntry = z.infer<typeof statusEntrySchema>;
