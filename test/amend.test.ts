@@ -249,6 +249,53 @@ test("preserves pre-existing unstaged symlink target on an owned partially-stage
   assert.equal(await readlink(join(directory, "owned.txt")), "user-target");
 });
 
+test("preserves malformed UTF-8 target bytes on an owned partially-staged symlink", async (t) => {
+  const { directory, runner, sessions, stage } = await fixture(t);
+  await unlink(join(directory, "owned.txt"));
+  await symlink(Buffer.from("staged-target"), join(directory, "owned.txt"));
+  await git(runner, directory, ["add", "--", "owned.txt"]);
+  const stagedSnapshot = await inspectRepository(runner, directory);
+  const updatedStage = { ...stage, currentIndexTree: stagedSnapshot.indexTree };
+  await sessions.updateStageSession(updatedStage);
+  await unlink(join(directory, "owned.txt"));
+  await symlink(Buffer.from([0xff]), join(directory, "owned.txt"));
+  const status = await readStatus(runner, stagedSnapshot);
+
+  const prepared = await prepareCommitAmend(runner, sessions, stagedSnapshot, {
+    expectedBranch: "main", expectedHead: stagedSnapshot.head, stageId: updatedStage.stageId,
+    worktreeSnapshotId: status.worktree_snapshot_id, message: "fix: preserve malformed symlink target\n",
+  });
+  const execution = await executePreparedCommitAmend(runner, prepared);
+
+  assert.notEqual(execution.data.commit, stagedSnapshot.head);
+  assert.deepEqual(await readlink(join(directory, "owned.txt"), { encoding: "buffer" }), Buffer.from([0xff]));
+});
+
+test("hook overwrite between colliding malformed tracked symlink targets is indeterminate", async (t) => {
+  const { directory, runner, sessions, stage } = await fixture(t);
+  await unlink(join(directory, "owned.txt"));
+  await symlink(Buffer.from("staged-target"), join(directory, "owned.txt"));
+  await git(runner, directory, ["add", "--", "owned.txt"]);
+  const stagedSnapshot = await inspectRepository(runner, directory);
+  const updatedStage = { ...stage, currentIndexTree: stagedSnapshot.indexTree };
+  await sessions.updateStageSession(updatedStage);
+  await unlink(join(directory, "owned.txt"));
+  await symlink(Buffer.from([0xff]), join(directory, "owned.txt"));
+  await hook(directory, "pre-commit", "node -e 'const fs=require(\"node:fs\");fs.unlinkSync(\"owned.txt\");fs.symlinkSync(Buffer.from([0xfe]),\"owned.txt\")'");
+  const status = await readStatus(runner, stagedSnapshot);
+  const prepared = await prepareCommitAmend(runner, sessions, stagedSnapshot, {
+    expectedBranch: "main", expectedHead: stagedSnapshot.head, stageId: updatedStage.stageId,
+    worktreeSnapshotId: status.worktree_snapshot_id, message: "fix: detect malformed symlink overwrite\n",
+  });
+  let caught: unknown;
+  try { await executePreparedCommitAmend(runner, prepared); } catch (error) { caught = error; }
+
+  assert.ok(caught instanceof ProvenMutationOutcome);
+  assert.equal(caught.result.status, "indeterminate");
+  assert.deepEqual(await readlink(join(directory, "owned.txt"), { encoding: "buffer" }), Buffer.from([0xfe]));
+  assert.ok(await sessions.getStage(updatedStage.stageId));
+});
+
 test("preserves the complete parent set of a merge HEAD", async (t) => {
   const { directory, runner, sessions, snapshot, stage } = await fixture(t);
   const tree = await git(runner, directory, ["rev-parse", `${snapshot.head}^{tree}`]);

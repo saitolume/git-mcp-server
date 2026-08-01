@@ -438,6 +438,24 @@ test("status snapshot covers untracked symlink targets, add-delete, and type cha
   assert.notEqual(changedType.worktree_snapshot_id, changedTarget.worktree_snapshot_id);
 });
 
+test("status snapshot distinguishes malformed UTF-8 bytes in tracked symlink targets", async (t) => {
+  const { directory, runner } = await createRepository(t);
+  const path = join(directory, "tracked-link");
+  await symlink(Buffer.from("tracked"), path);
+  await runGit(runner, directory, ["add", "tracked-link"]);
+  await runGit(runner, directory, ["commit", "-m", "track symlink"]);
+  const snapshot = await inspectRepository(runner, directory);
+
+  await unlink(path);
+  await symlink(Buffer.from([0xff]), path);
+  const first = await readStatus(runner, snapshot);
+  await unlink(path);
+  await symlink(Buffer.from([0xfe]), path);
+  const second = await readStatus(runner, snapshot);
+
+  assert.notEqual(second.worktree_snapshot_id, first.worktree_snapshot_id);
+});
+
 test("status expands untracked directories and rejects nested repositories and tracked FIFOs", async (t) => {
   const { directory, runner } = await createRepository(t);
   const snapshot = await inspectRepository(runner, directory);

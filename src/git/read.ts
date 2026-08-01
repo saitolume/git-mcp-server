@@ -241,6 +241,10 @@ function changedWhileHashing(): Error {
   return new Error("Tracked regular file changed while hashing");
 }
 
+function trackedSymlinkChangedWhileReading(): Error {
+  return new Error("Tracked symlink changed while reading its target");
+}
+
 export async function hashRegularFileForSnapshot(
   fullPath: string,
   expected: BigIntStats,
@@ -380,7 +384,16 @@ async function fingerprintTrackedPath(
     }
     if (stats.isSymbolicLink()) {
       await assertTrackedPathConfined(root, path);
-      return { path, index, kind: "symlink", mode, target: await readlink(fullPath) };
+      let target: Buffer;
+      try { target = await readlink(fullPath, { encoding: "buffer" }); }
+      catch { throw trackedSymlinkChangedWhileReading(); }
+      hashBudget.reserve(BigInt(target.byteLength));
+      let after: BigIntStats;
+      try { after = await lstat(fullPath, { bigint: true }); }
+      catch { throw trackedSymlinkChangedWhileReading(); }
+      throwIfDeadlineExceeded(signal);
+      if (!after.isSymbolicLink() || !samePathState(stats, after)) throw trackedSymlinkChangedWhileReading();
+      return { path, index, kind: "symlink", mode, target: target.toString("base64") };
     }
     if (isGitlink) {
       await assertTrackedPathConfined(root, path);
