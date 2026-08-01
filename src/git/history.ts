@@ -62,8 +62,11 @@ function complete(result: GitCommandResult): boolean {
 }
 
 function ordinaryFailure(result: GitCommandResult): boolean {
-  return result.exitCode !== 0 && result.signal === null && !result.timedOut && !result.aborted
-    && !result.stdoutTruncated && !result.stderrTruncated;
+  return result.exitCode !== 0 && result.signal === null && !result.timedOut && !result.aborted;
+}
+
+function hookSucceeded(result: GitCommandResult): boolean {
+  return result.exitCode === 0 && result.signal === null && !result.timedOut && !result.aborted;
 }
 
 function assertIdentity(expected: RepositorySnapshot, actual: RepositorySnapshot): void {
@@ -73,8 +76,17 @@ function assertIdentity(expected: RepositorySnapshot, actual: RepositorySnapshot
   }
 }
 
-function exactObjectId(value: string, label: string): string {
-  if (!OBJECT_ID.test(value)) reject("INVALID_INPUT", `${label} must be a full Git object ID`);
+function exactObjectId(value: string, label: string, width?: number): string {
+  if (!OBJECT_ID.test(value) || (width !== undefined && value.length !== width)) {
+    reject("INVALID_INPUT", `${label} must be a full Git object ID`);
+  }
+  return value;
+}
+
+function emittedObjectId(value: string, label: string, width: number): string {
+  if (!OBJECT_ID.test(value) || value.length !== width) {
+    reject("UNSUPPORTED_REPOSITORY_STATE", `${label} is not a valid repository object ID`);
+  }
   return value;
 }
 
@@ -84,27 +96,84 @@ async function runRead(runner: GitRunner, root: string, args: readonly string[],
   }, signal);
 }
 
-function parseRangeLines(output: string, base: string): readonly string[] {
-  if (output.length === 0 || !output.endsWith("\n") || !isWellFormedGitText(output)) {
-    reject("UNSUPPORTED_REPOSITORY_STATE", "Git returned a malformed commit range");
+class NulRangeParser {
+  private buffered = Buffer.alloc(0);
+  private readonly commits: string[] = [];
+  private previous: string;
+  private pendingCommit: string | undefined;
+
+  constructor(private readonly base: string, private readonly width: number) {
+    this.previous = base;
   }
-  const commits: string[] = [];
-  let previous = base;
-  for (const record of output.slice(0, -1).split("\n")) {
-    if (Buffer.byteLength(record, "utf8") > 16 * 1024 || !/^[0-9a-f]{40,64} [0-9a-f]{40,64}$/.test(record)) {
-      reject("UNSUPPORTED_REPOSITORY_STATE", "Git returned a non-linear commit range");
+
+  write(chunk: Buffer): void {
+    this.buffered = this.buffered.length === 0 ? Buffer.from(chunk) : Buffer.concat([this.buffered, chunk]);
+    while (true) {
+      const end = this.buffered.indexOf(0);
+      if (end < 0) {
+        if (this.buffered.length > 16 * 1024) reject("UNSUPPORTED_REPOSITORY_STATE", "Commit range record exceeds its limit");
+        return;
+      }
+      if (end > 16 * 1024) reject("UNSUPPORTED_REPOSITORY_STATE", "Commit range record exceeds its limit");
+      const record = this.buffered.subarray(0, end);
+      this.buffered = this.buffered.subarray(end + 1);
+      this.consume(record);
     }
-    const [commit, parent] = record.split(" ") as [string, string];
-    if (commit === undefined || parent === undefined || parent !== previous || commits.length >= RANGE_LIMIT) {
-      reject("UNSUPPORTED_REPOSITORY_STATE", "Commit range is not a bounded exact linear sequence");
-    }
-    commits.push(commit);
-    previous = commit;
   }
+
+  finish(): readonly string[] {
+    if (this.pendingCommit !== undefined || !this.buffered.equals(Buffer.from("\n")) || this.commits.length === 0) {
+      reject("UNSUPPORTED_REPOSITORY_STATE", "Git returned a malformed NUL-framed commit range");
+    }
+    return Object.freeze([...this.commits]);
+  }
+
+  private consume(raw: Buffer): void {
+    let bytes = raw;
+    if (this.pendingCommit === undefined && this.commits.length > 0) {
+      if (bytes[0] !== 10) reject("UNSUPPORTED_REPOSITORY_STATE", "Git returned a malformed NUL-framed commit range");
+      bytes = bytes.subarray(1);
+    }
+    const value = bytes.toString("utf8");
+    if (!isWellFormedGitText(value) || !Buffer.from(value, "utf8").equals(bytes) || !OBJECT_ID.test(value) || value.length !== this.width) {
+      reject("UNSUPPORTED_REPOSITORY_STATE", "Git returned an invalid commit range object ID");
+    }
+    if (this.pendingCommit === undefined) {
+      if (this.commits.length >= RANGE_LIMIT) reject("UNSUPPORTED_REPOSITORY_STATE", "Commit range exceeds its maximum count");
+      this.pendingCommit = value;
+      return;
+    }
+    if (value !== this.previous) reject("UNSUPPORTED_REPOSITORY_STATE", "Commit range is not an exact linear sequence");
+    this.commits.push(this.pendingCommit);
+    this.previous = this.pendingCommit;
+    this.pendingCommit = undefined;
+  }
+}
+
+async function readNulLinearRange(
+  runner: GitRunner,
+  root: string,
+  base: string,
+  head: string,
+  width: number,
+  signal?: AbortSignal,
+): Promise<readonly string[]> {
+  const parser = new NulRangeParser(base, width);
+  let result: GitCommandResult;
+  try {
+    result = await runner.runStreaming({
+      cwd: root,
+      args: ["--no-replace-objects", "rev-list", "--reverse", "--pretty=tformat:%H%x00%P%x00", "--no-commit-header", `${base}..${head}`],
+      timeoutMs: remainingDeadlineTimeoutMs(OPERATION_TIMEOUT_MS.read), maxStderrBytes: READ_OUTPUT_LIMIT,
+    }, (chunk) => parser.write(chunk), signal);
+  } catch { reject("UNSUPPORTED_REPOSITORY_STATE", "Unable to inspect the complete commit range"); }
+  if (!complete(result)) reject("UNSUPPORTED_REPOSITORY_STATE", "Unable to inspect the complete commit range");
+  const commits = parser.finish();
+  if (commits.at(-1) !== head) reject("UNSUPPORTED_REPOSITORY_STATE", "Commit range does not end at the expected HEAD");
   return commits;
 }
 
-function parseCommitObject(commit: string, object: string, expectedParent: string): LinearCommit {
+function parseCommitObject(commit: string, object: string, expectedParent: string, width: number): LinearCommit {
   if (!isWellFormedGitText(object) || object.includes("\0")) {
     reject("UNSUPPORTED_REPOSITORY_STATE", "Commit message is not well-formed UTF-8");
   }
@@ -114,6 +183,7 @@ function parseCommitObject(commit: string, object: string, expectedParent: strin
   const message = object.slice(separator + 2);
   const seen = new Set<string>();
   let parent: string | undefined;
+  let tree: string | undefined;
   for (const header of headers) {
     const space = header.indexOf(" ");
     const name = space > 0 ? header.slice(0, space) : "";
@@ -123,9 +193,10 @@ function parseCommitObject(commit: string, object: string, expectedParent: strin
       reject("UNSUPPORTED_REPOSITORY_STATE", "Commit contains unsupported metadata");
     }
     seen.add(name);
-    if (name === "parent") parent = value;
+    if (name === "parent") parent = emittedObjectId(value, "Commit parent", width);
+    if (name === "tree") tree = emittedObjectId(value, "Commit tree", width);
   }
-  if (!seen.has("tree") || !seen.has("parent") || !seen.has("author") || !seen.has("committer") || parent !== expectedParent) {
+  if (!seen.has("tree") || tree === undefined || !seen.has("parent") || !seen.has("author") || !seen.has("committer") || parent !== expectedParent) {
     reject("UNSUPPORTED_REPOSITORY_STATE", "Commit parent does not match the exact requested range");
   }
   return { commit, message };
@@ -140,20 +211,16 @@ export async function inspectLinearCommitRange(
   signal?: AbortSignal,
 ): Promise<readonly LinearCommit[]> {
   const base = exactObjectId(baseValue, "Base");
-  const head = exactObjectId(headValue, "Head");
+  const head = exactObjectId(headValue, "Head", base.length);
   const ancestor = await runRead(runner, root, ["--no-replace-objects", "merge-base", "--is-ancestor", base, head], signal);
   if (!complete(ancestor) || ancestor.stdout !== "") reject("INVALID_INPUT", "Base is not an ancestor of the expected HEAD");
-  const listed = await runRead(runner, root, ["--no-replace-objects", "rev-list", "--reverse", "--parents", `${base}..${head}`], signal);
-  if (!complete(listed)) reject("UNSUPPORTED_REPOSITORY_STATE", "Unable to inspect the complete commit range");
-  const commits = parseRangeLines(listed.stdout, base);
-  if (commits.length === 0) reject("INVALID_INPUT", "Commit range must contain at least one commit");
-  if (commits.at(-1) !== head) reject("UNSUPPORTED_REPOSITORY_STATE", "Commit range does not end at the expected HEAD");
+  const commits = await readNulLinearRange(runner, root, base, head, base.length, signal);
   const values: LinearCommit[] = [];
   let parent = base;
   for (const commit of commits) {
     const object = await runRead(runner, root, ["--no-replace-objects", "cat-file", "commit", commit], signal);
     if (!complete(object)) reject("UNSUPPORTED_REPOSITORY_STATE", "Unable to inspect a commit in the requested range");
-    values.push(parseCommitObject(commit, object.stdout, parent));
+    values.push(parseCommitObject(commit, object.stdout, parent, base.length));
     parent = commit;
   }
   return Object.freeze(values);
@@ -193,16 +260,35 @@ async function cleanStatus(runner: GitRunner, snapshot: RepositorySnapshot, sign
   return status.worktree_snapshot_id;
 }
 
-async function proveUnchanged(runner: GitRunner, state: PreparedState): Promise<void> {
-  const after = await inspectRepository(runner, state.snapshot.root);
-  assertIdentity(state.snapshot, after);
-  assertMutationReady(after, state.snapshot.branch!, state.snapshot.head);
-  if (after.indexTree !== state.snapshot.indexTree || after.headTree !== state.snapshot.headTree || !after.indexMatchesHead) {
-    throw new Error("Native hook changed the repository index or commit state");
+class HookStateChanged extends Error {
+  constructor() {
+    super("Native hook changed repository state");
+    this.name = "HookStateChanged";
   }
-  const worktreeSnapshotId = await cleanStatus(runner, after);
-  if (worktreeSnapshotId !== state.worktreeSnapshotId || await readRefFingerprint(runner, after.root) !== state.refsFingerprint) {
-    throw new Error("Native hook changed the repository worktree or refs");
+}
+
+async function proveUnchanged(runner: GitRunner, state: PreparedState): Promise<void> {
+  try {
+    const after = await inspectRepository(runner, state.snapshot.root);
+    assertIdentity(state.snapshot, after);
+    assertMutationReady(after, state.snapshot.branch!, state.snapshot.head);
+    await state.sessions.assertNoActiveSession(after.repositoryId);
+    if (after.indexTree !== state.snapshot.indexTree || after.headTree !== state.snapshot.headTree || !after.indexMatchesHead) {
+      throw new HookStateChanged();
+    }
+    const worktreeSnapshotId = await cleanStatus(runner, after);
+    if (worktreeSnapshotId !== state.worktreeSnapshotId || await readRefFingerprint(runner, after.root) !== state.refsFingerprint) {
+      throw new HookStateChanged();
+    }
+    const commits = await inspectLinearCommitRange(runner, after.root, state.base, after.head);
+    if (commits.length !== state.commits.length || commits.some((entry, index) =>
+      entry.commit !== state.commits[index]?.commit || entry.message !== state.commits[index]?.message)) {
+      throw new HookStateChanged();
+    }
+  } catch {
+    // Post-hook proof has no safe recovery path: any failed comparison or read
+    // prevents a success result and wins over a private hook outcome.
+    throw new HookStateChanged();
   }
 }
 
@@ -233,26 +319,37 @@ export async function validateMessagesWithNativeHook(
   hooksPath: string,
   messages: readonly string[],
   signal?: AbortSignal,
+  afterEach?: () => Promise<void>,
 ): Promise<void> {
   for (const message of messages) {
     assertWellFormedGitText(message, "Commit message");
     let wrappers: Awaited<ReturnType<typeof createHookWrappers>> | undefined;
     let result: GitCommandResult | undefined;
+    let executionError: unknown;
+    let cleanupError: unknown;
     try {
       wrappers = await createHookWrappers(hooksPath);
       const activeWrappers = wrappers;
       result = await withNativeCommitMessageFile(message, async (path) => runner.run({
         cwd: root, args: ["hook", "run", "--ignore-missing", "commit-msg", "--", path],
-        timeoutMs: remainingDeadlineTimeoutMs(OPERATION_TIMEOUT_MS.commit), maxOutputBytes: READ_OUTPUT_LIMIT,
+        timeoutMs: remainingDeadlineTimeoutMs(OPERATION_TIMEOUT_MS.commit), maxOutputBytes: 0,
         hookExecution: { wrappersDirectory: activeWrappers.directory, failureConsumer: activeWrappers.failureConsumer },
       }, signal));
-    } finally {
-      try { await wrappers?.cleanup(); } catch { /* Private wrapper cleanup does not affect hook proof. */ }
+    } catch (error) {
+      executionError = error;
+    }
+    try { await wrappers?.cleanup(); }
+    catch (error) { cleanupError = error; }
+    // This callback is deliberately run even after reject/timeout/abort/wrapper failures.
+    // A state change is stronger evidence than the hook's private diagnostic outcome.
+    await afterEach?.();
+    if (executionError !== undefined || cleanupError !== undefined) {
+      throw executionError ?? cleanupError;
     }
     if (result !== undefined && ordinaryFailure(result) && wrappers?.rejectedHook() === "commit-msg") {
       throw new BridgeRejection({ code: "HOOK_FAILED", message: HOOK_FAILED_MESSAGE, details: { hook: "commit-msg" } });
     }
-    if (result === undefined || !complete(result)) throw new Error("Native commit-msg hook did not complete successfully");
+    if (result === undefined || !hookSucceeded(result)) throw new Error("Native commit-msg hook did not complete successfully");
   }
 }
 
@@ -314,21 +411,19 @@ export async function executePreparedCommitRangeValidation(
   preparedStates.delete(prepared);
   try {
     await proveStillPrepared(runner, state, signal);
-    await validateMessagesWithNativeHook(runner, state.snapshot.root, state.hooksPath, state.commits.map(({ message }) => message), signal);
+    await validateMessagesWithNativeHook(
+      runner, state.snapshot.root, state.hooksPath, state.commits.map(({ message }) => message), signal,
+      async () => proveUnchanged(runner, state),
+    );
   } catch (error) {
     if (error instanceof BridgeRejection && error.error.code === "HOOK_FAILED") {
       throw new ProvenMutationOutcome<CommitRangeValidateData>({ status: "failed", operation: "git_commit_range_validate", warnings: [], error: error.error });
     }
     throw new ProvenMutationOutcome<CommitRangeValidateData>({
       status: "failed", operation: "git_commit_range_validate", warnings: [],
-      error: { code: "GIT_FAILED", message: "Native commit-msg validation did not preserve the repository" },
-    });
-  }
-  try { await proveUnchanged(runner, state); }
-  catch {
-    throw new ProvenMutationOutcome<CommitRangeValidateData>({
-      status: "failed", operation: "git_commit_range_validate", warnings: [],
-      error: { code: "GIT_FAILED", message: "Native commit-msg hook changed the repository" },
+      error: { code: "GIT_FAILED", message: error instanceof HookStateChanged
+        ? "Native commit-msg hook changed the repository"
+        : "Native commit-msg validation did not preserve the repository" },
     });
   }
   return { base: state.base, head: state.snapshot.head, commit_count: state.commits.length, hook: "commit-msg" };
