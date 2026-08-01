@@ -276,6 +276,7 @@ const operationDataSchemas: Readonly<Record<string, z.ZodType>> = {
   git_push: pushDataSchema,
   git_commit_range_validate: commitRangeValidateDataSchema,
   git_reword: rewordDataSchema,
+  git_commit_amend: commitAmendDataSchema,
 };
 
 /** Validates persisted data against the exact public output schema for its operation. */

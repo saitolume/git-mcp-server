@@ -4,15 +4,19 @@ import type {
   GitOperationGetInput, GitAddInput, GitCommitInput, GitDiffInput, GitFetchInput,
   GitMergeAbortInput, GitMergeContinueInput, GitMergeInput, GitPushInput,
   GitRestoreStagedInput, GitRestoreWorktreeInput, GitStatusInput, GitSwitchAttachInput, GitSwitchCreateInput,
-  GitCommitRangeValidateInput, GitRewordInput,
+  GitCommitRangeValidateInput, GitRewordInput, GitCommitAmendInput,
 } from "../domain/inputs.js";
 import {
   BridgeRejection, failure, success,
   type AddData, type BridgeResult, type CommitData, type DiffData, type FetchData,
   type MergeAbortData, type MergeContinueData, type MergeData, type PushData,
   type RestoreStagedData, type RestoreWorktreeData, type StatusData, type SwitchAttachData, type SwitchCreateData,
-  type CommitRangeValidateData, type RewordData,
+  type CommitRangeValidateData, type RewordData, type CommitAmendData,
 } from "../domain/result.js";
+import {
+  createAmendAfterPersistCleanup, executePreparedCommitAmend, prepareCommitAmend,
+  preparedCommitAmendObservation, type CommitAmendExecutionOutcome, type PreparedCommitAmend,
+} from "../git/amend.js";
 import {
   executePreparedSwitchAttach, prepareSwitchAttach, preparedSwitchAttachObservation,
   executePreparedSwitchCreate, prepareSwitchCreate, preparedSwitchCreateObservation,
@@ -82,6 +86,7 @@ export interface BridgeService {
   git_push(input: GitPushInput, signal?: AbortSignal, progress?: OperationProgress): Promise<BridgeResult<PushData>>;
   git_commit_range_validate(input: GitCommitRangeValidateInput, signal?: AbortSignal, progress?: OperationProgress): Promise<BridgeResult<CommitRangeValidateData>>;
   git_reword(input: GitRewordInput, signal?: AbortSignal, progress?: OperationProgress): Promise<BridgeResult<RewordData>>;
+  git_commit_amend(input: GitCommitAmendInput, signal?: AbortSignal, progress?: OperationProgress): Promise<BridgeResult<CommitAmendData>>;
   git_operation_get(input: GitOperationGetInput, signal?: AbortSignal, progress?: OperationProgress): Promise<BridgeResult<unknown>>;
 }
 
@@ -344,6 +349,44 @@ export class DefaultBridgeService implements BridgeService {
         afterPersist: createCommitAfterPersistCleanup(this.dependencies.sessions, {
           requestId: input.request_id, repositoryId, operation: "git_commit",
           stageId: input.stage_id, expectedBranch: input.expected_branch, expectedHead: input.expected_head,
+        }),
+      };
+    }, signal, progress);
+  }
+
+  git_commit_amend(
+    input: GitCommitAmendInput,
+    signal?: AbortSignal,
+    progress?: OperationProgress,
+  ): Promise<BridgeResult<CommitAmendData>> {
+    return this.mutate("git_commit_amend", input, (repositoryId) => {
+      let prepared: PreparedCommitAmend | undefined;
+      let outcome: CommitAmendExecutionOutcome | undefined;
+      return {
+        preflight: async (snapshot) => {
+          prepared = await prepareCommitAmend(this.dependencies.runner, this.dependencies.sessions, snapshot, {
+            expectedBranch: input.expected_branch,
+            expectedHead: input.expected_head,
+            stageId: input.stage_id,
+            worktreeSnapshotId: input.worktree_snapshot_id,
+            message: input.message,
+          }, signal);
+          return preparedCommitAmendObservation(prepared);
+        },
+        mutate: async () => {
+          outcome = await executePreparedCommitAmend(this.dependencies.runner, prepared!, signal);
+          return outcome.data;
+        },
+        postflight: async (value) => outputObservation(value),
+        warnings: () => outcome?.warnings ?? [],
+        classify: (error) => classifyOperationError("git_commit_amend", error),
+        afterPersist: createAmendAfterPersistCleanup(this.dependencies.sessions, {
+          requestId: input.request_id,
+          repositoryId,
+          operation: "git_commit_amend",
+          stageId: input.stage_id,
+          expectedBranch: input.expected_branch,
+          expectedHead: input.expected_head,
         }),
       };
     }, signal, progress);

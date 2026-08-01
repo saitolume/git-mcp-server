@@ -520,6 +520,18 @@ function worktreeSnapshotIdFromFingerprints(
   })).digest("hex");
 }
 
+function unownedWorktreeContentSnapshotIdFromFingerprints(
+  entries: readonly ParsedStatusEntry[],
+  fingerprints: ReadonlyMap<string, Readonly<Record<string, unknown>>>,
+): string {
+  return createHash("sha256").update("git-mcp-server:unowned-worktree-content:v1\0").update(JSON.stringify({
+    entries,
+    fingerprints: [...fingerprints.entries()]
+      .sort(([left], [right]) => compareText(left, right))
+      .map(([, fingerprint]) => fingerprint),
+  })).digest("hex");
+}
+
 async function readParsedStatus(
   runner: GitRunner,
   snapshot: RepositorySnapshot,
@@ -604,6 +616,28 @@ export async function readStatusWithTrackedWorktreeProof(
       outsideFingerprints,
     ),
   };
+}
+
+/** Complete filesystem-content proof for every Git-visible path outside one owned path set. */
+export async function readUnownedWorktreeContentSnapshotId(
+  runner: GitRunner,
+  snapshot: RepositorySnapshot,
+  excludedPaths: readonly string[],
+  signal?: AbortSignal,
+): Promise<string> {
+  const excluded = new Set(excludedPaths);
+  const { tracked, entries } = await readParsedStatus(runner, snapshot, signal);
+  const budget = createWorktreeHashBudget();
+  const fingerprints = new Map(
+    [...await trackedPathFingerprints(runner, snapshot, tracked, signal, true, budget)]
+      .filter(([path]) => !excluded.has(path)),
+  );
+  for (const [path, fingerprint] of await untrackedPathFingerprints(snapshot, entries, excluded, budget, signal)) {
+    fingerprints.set(path, fingerprint);
+  }
+  const outsideEntries = entries.filter((entry) => !excluded.has(entry.path)
+    && (entry.sourcePath === undefined || !excluded.has(entry.sourcePath)));
+  return unownedWorktreeContentSnapshotIdFromFingerprints(outsideEntries, fingerprints);
 }
 
 /** Reads the porcelain status and returns a content-free, repeatable worktree snapshot. */

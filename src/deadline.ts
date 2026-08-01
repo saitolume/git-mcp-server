@@ -100,7 +100,9 @@ export function operationTimeoutMs(operation: string): number {
   if (["git_add", "git_restore_staged", "git_restore_worktree", "git_switch_create", "git_switch_attach"].includes(operation)) {
     return OPERATION_TIMEOUT_MS.stage;
   }
-  if (["git_commit", "git_commit_range_validate", "git_reword"].includes(operation)) return OPERATION_TIMEOUT_MS.commit;
+  if (["git_commit", "git_commit_range_validate", "git_reword", "git_commit_amend"].includes(operation)) {
+    return OPERATION_TIMEOUT_MS.commit;
+  }
   if (["git_merge", "git_merge_continue", "git_merge_abort"].includes(operation)) return OPERATION_TIMEOUT_MS.merge;
   if (["git_fetch", "git_push"].includes(operation)) return OPERATION_TIMEOUT_MS.remote;
   throw new RangeError(`Unknown operation timeout class: ${operation}`);
