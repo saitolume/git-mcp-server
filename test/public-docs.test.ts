@@ -3,6 +3,13 @@ import { existsSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { dirname, extname, resolve } from "node:path";
 import test from "node:test";
+import {
+  gitCommitAmendInput,
+  gitCommitRangeValidateInput,
+  gitPushForceWithLeaseInput,
+  gitPushInput,
+  gitRewordInput,
+} from "../src/domain/inputs.js";
 import { repositoryRoot } from "./package-test-utils.js";
 
 const requiredFiles = [
@@ -40,6 +47,8 @@ const exampleRequestIds = [
   "018f47d2-7b2a-7d75-b9dd-5ea8abca0101",
   "018f47d2-7b2a-7d75-b9dd-5ea8abca0102",
   "018f47d2-7b2a-7d75-b9dd-5ea8abca0103",
+  "018f47d2-7b2a-7d75-b9dd-5ea8abca0104",
+  "018f47d2-7b2a-7d75-b9dd-5ea8abca0105",
 ] as const;
 const exampleBase = "1111111111111111111111111111111111111111";
 const exampleHead = "2222222222222222222222222222222222222222";
@@ -57,6 +66,22 @@ function localMarkdownLinks(markdown: string): readonly string[] {
 
 function documentedTools(readme: string): readonly string[] {
   return [...readme.matchAll(/^\| `(git_[^`]+)` \|/gm)].map((match) => match[1] ?? "");
+}
+
+const guardedHistorySchemas = {
+  git_commit_range_validate: gitCommitRangeValidateInput,
+  git_reword: gitRewordInput,
+  git_push_force_with_lease: gitPushForceWithLeaseInput,
+  git_push: gitPushInput,
+  git_commit_amend: gitCommitAmendInput,
+} as const;
+
+function guardedHistoryExamples(readme: string): readonly { tool: keyof typeof guardedHistorySchemas; arguments: unknown }[] {
+  return [...readme.matchAll(/```json\n([\s\S]*?)\n```/g)]
+    .map((match) => JSON.parse(match[1] ?? "") as { tool?: string; arguments?: unknown })
+    .filter((example): example is { tool: keyof typeof guardedHistorySchemas; arguments: unknown } =>
+      typeof example.tool === "string" && example.tool in guardedHistorySchemas,
+    );
 }
 
 test("public documentation provides the published user contract", async () => {
@@ -99,6 +124,13 @@ test("public documentation provides the published user contract", async () => {
   assert.deepEqual(documentedTools(englishReadme), expectedTools);
   assert.deepEqual(documentedTools(japaneseReadme), expectedTools);
   for (const readme of [englishReadme, japaneseReadme]) {
+    const examples = guardedHistoryExamples(readme);
+    assert.equal(examples.length, 6);
+    for (const example of examples) {
+      assert.equal(guardedHistorySchemas[example.tool].safeParse(example.arguments).success, true, example.tool);
+    }
+  }
+  for (const readme of [englishReadme, japaneseReadme]) {
     for (const required of [
       "HOOK_FAILED",
       "error.details.hook",
@@ -128,7 +160,7 @@ test("public documentation provides the published user contract", async () => {
       '"mode": "new_branch"',
       '"expected_remote_head": "2222222222222222222222222222222222222222"',
       '"stage_id": "stage-example-20260801"',
-      '"worktree_snapshot_id": "snapshot-example-20260801"',
+      '"worktree_snapshot_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"',
       "caller approval policy",
       "signed",
       "redacted",
@@ -143,12 +175,24 @@ test("public documentation provides the published user contract", async () => {
     "commit messages are redacted",
     "git_push remains fast-forward-only",
   ]) assert.match(englishReadme, new RegExp(escapeRegExp(required), "i"));
+  for (const boundary of [
+    /fresh observation[\s\S]{0,80}before delivery/i,
+    /no automatic refresh or retry/i,
+    /explicit human decision/i,
+    /externally added[\s\S]{0,40}commit/i,
+  ]) assert.match(englishReadme, boundary);
   for (const required of [
     "force permission は caller approval policy",
     "exact remote CAS は mandatory",
     "signed source commits は reject",
     "git_push は fast-forward-only のまま",
   ]) assert.match(japaneseReadme, new RegExp(escapeRegExp(required)));
+  for (const boundary of [
+    /delivery の直前に fresh observation/,
+    /automatic refresh\/retry は行わず/,
+    /explicit human decision/,
+    /externally added commit/,
+  ]) assert.match(japaneseReadme, boundary);
   assert.match(japaneseReadme, /commit messages[\s\S]{0,80}redacted/);
   for (const required of [
     "git_commit_range_validate",

@@ -71,6 +71,12 @@ test("provider checklist documents a provider-neutral source-build acceptance ro
     "replacement branch",
     "exact remote CAS",
   ]) assert.ok(checklist.includes(required), `checklist is missing: ${required}`);
+  for (const boundary of [
+    /fresh observation[\s\S]{0,80}before delivery/i,
+    /no automatic refresh or retry/i,
+    /explicit\s+human decision/i,
+    /externally added[\s\S]{0,40}commit/i,
+  ]) assert.match(checklist, boundary);
   assert.match(checklist, /dedicated non-production fixture repository/i);
   assert.match(checklist, /does not require provider-specific package installation/i);
 });

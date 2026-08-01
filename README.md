@@ -139,6 +139,12 @@ force permission is a caller approval policy: a client or user may authorize
 this tool, but the bridge never decides to discard remote commits. An exact remote CAS is mandatory;
 provider or branch protection may still reject the update.
 
+Take a fresh observation immediately before delivery and use that exact remote
+head as the lease. If the remote CAS drifts, stop with the drift evidence
+preserved: perform no automatic refresh or retry. An explicit human decision is
+required before a new observation may be used to discard an externally added
+commit.
+
 ```json
 {
   "tool": "git_reword",
@@ -217,7 +223,7 @@ To amend only the current commit, first create the normal stage session with
     "expected_branch": "feature/history-example",
     "expected_head": "2222222222222222222222222222222222222222",
     "stage_id": "stage-example-20260801",
-    "worktree_snapshot_id": "snapshot-example-20260801",
+    "worktree_snapshot_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
     "message": "fix(history): amend the owned staged change"
   }
 }

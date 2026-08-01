@@ -28,7 +28,11 @@ evidence and use only full object IDs:
    separate destructive approval for `git_reword` followed by
    `git_push_force_with_lease`. Force permission is a caller approval policy;
    exact remote CAS is mandatory and provider or branch protection may reject
-   the update.
+   the update. Take a fresh observation immediately before delivery and bind
+   that exact remote head as the lease. On remote-CAS drift, stop with the drift
+   evidence preserved and perform no automatic refresh or retry. An explicit
+   human decision is required before a new observation may be used to discard
+   an externally added commit.
 3. Exercise the replacement branch route with `git_reword` using
    `destination.mode: "new_branch"`, then ordinary `git_push`. This keeps the
    original branch unchanged and `git_push` remains fast-forward-only.

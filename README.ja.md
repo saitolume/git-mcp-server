@@ -133,6 +133,11 @@ head を使って separate destructive delivery tool を呼びます。force per
 discard する判断を行うことはありません。exact remote CAS は mandatory です。provider または
 branch protection が update を reject することはあります。
 
+delivery の直前に fresh observation を取り、その exact remote head を lease に使います。
+remote CAS が drift した場合は、drift evidence を preserved して stop し、automatic refresh/retry は行わず
+終了します。new observation を externally added commit の discard に使う前には explicit human decision
+が必要です。
+
 ```json
 {
   "tool": "git_reword",
@@ -211,7 +216,7 @@ exact stage と snapshot ID を保持してから呼びます。
     "expected_branch": "feature/history-example",
     "expected_head": "2222222222222222222222222222222222222222",
     "stage_id": "stage-example-20260801",
-    "worktree_snapshot_id": "snapshot-example-20260801",
+    "worktree_snapshot_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
     "message": "fix(history): amend the owned staged change"
   }
 }
