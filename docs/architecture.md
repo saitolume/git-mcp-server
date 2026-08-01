@@ -47,7 +47,9 @@ Commit history sometimes fails a repository policy only after it has been
 published. The bridge needs two distinct recovery routes: retain the current
 branch name when its remote history may be replaced, or create a replacement
 branch without changing the original branch. Force-push permission belongs to
-the caller and its MCP approval policy, not to a bridge-level branch-name rule.
+the caller approval policy, not to a bridge-level branch-name rule. An exact
+remote CAS is mandatory before a remote history replacement; provider or branch
+protection can still reject it.
 The bridge still constrains every operation to exact repository state and one
 typed Git effect.
 
@@ -87,11 +89,13 @@ headers, and destination-branch collisions. Messages are bounded, validated as
 well-formed Unicode, passed on standard input, checked by the native
 `commit-msg` hook, and redacted from the durable request record. Request hashes
 continue to bind the original unredacted input for idempotent replay.
+Commit messages are redacted from durable records but stay in the request hash
+used for replay.
 
 Each recreated commit retains the original tree, author, committer, and
 supported metadata while mapping its parent to the preceding recreated commit.
 Signing is `disabled_by_policy`; a signed source commit is rejected instead of
-silently losing its signature. Before moving a ref, the bridge proves pairwise
+silently losing its signature: signed source commits are rejected. Before moving a ref, the bridge proves pairwise
 tree equality for every old/new commit and final-tree equality for the old and
 new heads. The local ref update uses an exact old-object compare-and-swap and
 keeps native reference-transaction hooks enabled. The operation never accesses
@@ -139,7 +143,7 @@ therefore rejects before replacement; after an interrupted transport, the
 bridge reconciles the exact local and remote object IDs before publishing a
 terminal or indeterminate result.
 
-The existing fast-forward-only `git_push` remains unchanged. This additive tool
+The existing `git_push` remains fast-forward-only and unchanged. This additive tool
 keeps its schema and non-destructive approval behavior backward compatible
 while allowing callers that explicitly authorize history replacement to use a
 separate, auditable route.

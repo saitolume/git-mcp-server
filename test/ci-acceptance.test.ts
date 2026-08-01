@@ -64,6 +64,12 @@ test("provider checklist documents a provider-neutral source-build acceptance ro
     "dist/cli.js",
     "git_status",
     "git_operation_get",
+    "git_commit_range_validate",
+    "git_reword",
+    "git_push_force_with_lease",
+    "git_commit_amend",
+    "replacement branch",
+    "exact remote CAS",
   ]) assert.ok(checklist.includes(required), `checklist is missing: ${required}`);
   assert.match(checklist, /dedicated non-production fixture repository/i);
   assert.match(checklist, /does not require provider-specific package installation/i);
@@ -90,4 +96,12 @@ test("README documents explicit operations, replay recovery, and trusted-reposit
   assert.match(readme, /trusted repositories/i);
   assert.match(readme, /Native hooks are\s+enabled/i);
   assert.match(readme, /--no-gpg-sign/);
+  const normalizedReadme = readme.toLowerCase();
+  for (const required of [
+    "caller approval policy",
+    "exact remote CAS is mandatory",
+    "commit messages are redacted",
+    "git_push remains fast-forward-only",
+  ]) assert.ok(normalizedReadme.includes(required.toLowerCase()), `README is missing guarded-history boundary: ${required}`);
+  assert.match(readme, /signed source commits are rejected/i);
 });

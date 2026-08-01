@@ -77,7 +77,11 @@ client session を完全に restart し、client に新しい tool schema を再
 | `git_merge` | expected fetched `origin` tracking ref を merge するか、conflict session を返す。 |
 | `git_merge_continue` | resolved paths が staged された後に declared merge session を完了する。 |
 | `git_merge_abort` | declared in-progress merge session を destructive に abort する。 |
-| `git_push` | expected remote head を確認後に expected local branch head を push する。 |
+| `git_push` | expected remote head を確認後に expected local branch head を push する。fast-forward-only のまま維持する。 |
+| `git_push_force_with_lease` | exact に caller が観測した remote head lease を使い、`origin` の同名 branch を destructive に置き換える。 |
+| `git_commit_range_validate` | exact linear `base..HEAD` range の各 commit に native `commit-msg` hook を実行する。 |
+| `git_reword` | exact linear range を replacement message で再作成し、各 tree が不変であることを証明して current または new local branch に出力する。 |
+| `git_commit_amend` | owned stage session と guarded worktree snapshot だけで current unsigned commit を置き換える。 |
 | `git_operation_get` | request ID の durable result を読む。 |
 
 ## Typical workflow
@@ -99,6 +103,126 @@ name、その full `expected_branch_head` を渡します。target branch は存
 および observed HEAD が detached worktree HEAD と同一で、別 worktree に checkout されて
 いない必要があります。current operation state は `none`、index と untracked paths を含む
 complete worktree は clean、active bridge session は存在しない必要があります。
+
+## Guarded history recovery の例
+
+以下の object ID はすべて full object ID、`request_id` はすべて固定の example UUID です。
+repository path、ID、branch、message、request ID は trusted repository で観測した値に置き換えます。
+実装 source commit では `pnpm install --frozen-lockfile && pnpm build` を実行し、absolute
+`dist/cli.js` command を維持してから、MCP server と client session を restart して新しい tool を再検出させます。
+
+最初に exact current range を validate します。validation は range の各 commit に対して順に
+repository の native `commit-msg` hook を実行します。
+
+```json
+{
+  "tool": "git_commit_range_validate",
+  "arguments": {
+    "repository": "/absolute/path/to/repository",
+    "request_id": "018f47d2-7b2a-7d75-b9dd-5ea8abca0100",
+    "expected_branch": "feature/history-example",
+    "expected_head": "2222222222222222222222222222222222222222",
+    "base": "1111111111111111111111111111111111111111"
+  }
+}
+```
+
+current-branch route では complete ordered range を reword し、直前に観測した remote
+head を使って separate destructive delivery tool を呼びます。force permission は caller approval policy
+であり、client または user は tool を authorize できますが、bridge が remote commits を
+discard する判断を行うことはありません。exact remote CAS は mandatory です。provider または
+branch protection が update を reject することはあります。
+
+```json
+{
+  "tool": "git_reword",
+  "arguments": {
+    "repository": "/absolute/path/to/repository",
+    "request_id": "018f47d2-7b2a-7d75-b9dd-5ea8abca0101",
+    "expected_branch": "feature/history-example",
+    "expected_head": "2222222222222222222222222222222222222222",
+    "base": "1111111111111111111111111111111111111111",
+    "commits": [{
+      "commit": "2222222222222222222222222222222222222222",
+      "message": "feat(history): clarify recovery"
+    }],
+    "destination": { "mode": "current_branch" }
+  }
+}
+```
+
+```json
+{
+  "tool": "git_push_force_with_lease",
+  "arguments": {
+    "repository": "/absolute/path/to/repository",
+    "request_id": "018f47d2-7b2a-7d75-b9dd-5ea8abca0102",
+    "expected_branch": "feature/history-example",
+    "expected_head": "3333333333333333333333333333333333333333",
+    "expected_remote_head": "2222222222222222222222222222222222222222"
+  }
+}
+```
+
+replacement-branch route では original branch を変更せずに new local branch を作成して switch
+します。その branch は normal `git_push` で push できます。git_push は fast-forward-only のまま
+であり、published history を置き換えません。
+
+```json
+{
+  "tool": "git_reword",
+  "arguments": {
+    "repository": "/absolute/path/to/repository",
+    "request_id": "018f47d2-7b2a-7d75-b9dd-5ea8abca0103",
+    "expected_branch": "feature/history-example",
+    "expected_head": "2222222222222222222222222222222222222222",
+    "base": "1111111111111111111111111111111111111111",
+    "commits": [{
+      "commit": "2222222222222222222222222222222222222222",
+      "message": "feat(history): clarify replacement route"
+    }],
+    "destination": { "mode": "new_branch", "branch": "feature/history-reworded" }
+  }
+}
+```
+
+```json
+{
+  "tool": "git_push",
+  "arguments": {
+    "repository": "/absolute/path/to/repository",
+    "request_id": "018f47d2-7b2a-7d75-b9dd-5ea8abca0104",
+    "expected_branch": "feature/history-reworded",
+    "expected_head": "3333333333333333333333333333333333333333",
+    "expected_remote_head": null
+  }
+}
+```
+
+current commit だけを amend するには、先に `git_add` で normal stage session を作成し、その
+exact stage と snapshot ID を保持してから呼びます。
+
+```json
+{
+  "tool": "git_commit_amend",
+  "arguments": {
+    "repository": "/absolute/path/to/repository",
+    "request_id": "018f47d2-7b2a-7d75-b9dd-5ea8abca0105",
+    "expected_branch": "feature/history-example",
+    "expected_head": "2222222222222222222222222222222222222222",
+    "stage_id": "stage-example-20260801",
+    "worktree_snapshot_id": "snapshot-example-20260801",
+    "message": "fix(history): amend the owned staged change"
+  }
+}
+```
+
+signed source commits は reject され、signing は `disabled_by_policy` のままです。
+commit messages は durable request records で redacted されますが、original message は replay 用
+request hash に含まれます。native `commit-msg`、`pre-commit`、reference-transaction、pre-push
+hooks は enabled のままで、hook rejection は redacted な `HOOK_FAILED` result です。既存の
+git_push は fast-forward-only のままで backward compatibility を維持します。この追加は unreleased
+であり、この source change から npm release、tag、`latest` availability を推測しないでください。
 
 ## Safety boundaries
 

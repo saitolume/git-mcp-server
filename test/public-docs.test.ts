@@ -28,8 +28,22 @@ const expectedTools = [
   "git_merge_continue",
   "git_merge_abort",
   "git_push",
+  "git_push_force_with_lease",
+  "git_commit_range_validate",
+  "git_reword",
+  "git_commit_amend",
   "git_operation_get",
 ];
+
+const exampleRequestIds = [
+  "018f47d2-7b2a-7d75-b9dd-5ea8abca0100",
+  "018f47d2-7b2a-7d75-b9dd-5ea8abca0101",
+  "018f47d2-7b2a-7d75-b9dd-5ea8abca0102",
+  "018f47d2-7b2a-7d75-b9dd-5ea8abca0103",
+] as const;
+const exampleBase = "1111111111111111111111111111111111111111";
+const exampleHead = "2222222222222222222222222222222222222222";
+const exampleRewordedHead = "3333333333333333333333333333333333333333";
 
 function escapeRegExp(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -48,12 +62,13 @@ function documentedTools(readme: string): readonly string[] {
 test("public documentation provides the published user contract", async () => {
   for (const path of requiredFiles) assert.ok(existsSync(resolve(repositoryRoot, path)), `missing required public file: ${path}`);
 
-  const [license, englishReadme, japaneseReadme, security, architecture] = await Promise.all([
+  const [license, englishReadme, japaneseReadme, security, architecture, providerChecklist] = await Promise.all([
     readFile(resolve(repositoryRoot, "LICENSE"), "utf8"),
     readFile(resolve(repositoryRoot, "README.md"), "utf8"),
     readFile(resolve(repositoryRoot, "README.ja.md"), "utf8"),
     readFile(resolve(repositoryRoot, "SECURITY.md"), "utf8"),
     readFile(resolve(repositoryRoot, "docs/architecture.md"), "utf8"),
+    readFile(resolve(repositoryRoot, "docs/acceptance/provider-checklist.md"), "utf8"),
   ]);
 
   assert.match(license, /^MIT License\n\nCopyright \(c\) 2026 saitolume\n/);
@@ -99,6 +114,61 @@ test("public documentation provides the published user contract", async () => {
   assert.match(security, /Private Vulnerability Reporting/);
   assert.match(architecture, /```mermaid[\s\S]*stdio MCP[\s\S]*native Git[\s\S]*durable journal/);
   assert.match(architecture, /git_switch_attach[\s\S]*expected_branch_head[\s\S]*git switch --no-guess <branch>/);
+  for (const document of [englishReadme, japaneseReadme]) {
+    for (const requestId of exampleRequestIds) assert.match(document, new RegExp(escapeRegExp(requestId)));
+    for (const objectId of [exampleBase, exampleHead, exampleRewordedHead]) {
+      assert.match(document, new RegExp(escapeRegExp(objectId)));
+    }
+    for (const required of [
+      "git_commit_range_validate",
+      "git_reword",
+      "git_push_force_with_lease",
+      "git_commit_amend",
+      '"mode": "current_branch"',
+      '"mode": "new_branch"',
+      '"expected_remote_head": "2222222222222222222222222222222222222222"',
+      '"stage_id": "stage-example-20260801"',
+      '"worktree_snapshot_id": "snapshot-example-20260801"',
+      "caller approval policy",
+      "signed",
+      "redacted",
+      "fast-forward-only",
+      "restart",
+    ]) assert.match(document, new RegExp(escapeRegExp(required)));
+  }
+  for (const required of [
+    "force permission is a caller approval policy",
+    "exact remote CAS is mandatory",
+    "signed source commits are rejected",
+    "commit messages are redacted",
+    "git_push remains fast-forward-only",
+  ]) assert.match(englishReadme, new RegExp(escapeRegExp(required), "i"));
+  for (const required of [
+    "force permission は caller approval policy",
+    "exact remote CAS は mandatory",
+    "signed source commits は reject",
+    "git_push は fast-forward-only のまま",
+  ]) assert.match(japaneseReadme, new RegExp(escapeRegExp(required)));
+  assert.match(japaneseReadme, /commit messages[\s\S]{0,80}redacted/);
+  for (const required of [
+    "git_commit_range_validate",
+    "git_reword",
+    "git_push_force_with_lease",
+    "git_commit_amend",
+    "caller approval policy",
+    "exact remote CAS",
+    "signed",
+    "redact",
+    "fast-forward-only",
+  ]) assert.match(architecture, new RegExp(escapeRegExp(required)));
+  for (const required of [
+    "git_commit_range_validate",
+    "git_reword",
+    "git_push_force_with_lease",
+    "git_commit_amend",
+    "replacement branch",
+    "exact remote CAS",
+  ]) assert.match(providerChecklist, new RegExp(escapeRegExp(required)));
 });
 
 test("relative links in public documentation resolve within the repository", async () => {
