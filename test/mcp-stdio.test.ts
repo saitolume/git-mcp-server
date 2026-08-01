@@ -331,7 +331,8 @@ test("MCP stdio cancellation aborts a long-running Git process without corruptin
     { signal: controller.signal, timeout: 10_000 },
   );
   let started = false;
-  for (let attempt = 0; attempt < 100; attempt += 1) {
+  // Keep this below the 10-second tool timeout while tolerating full-suite process contention.
+  for (let attempt = 0; attempt < 500; attempt += 1) {
     try { await readFile(marker); started = true; break; }
     catch { await new Promise((resolve) => setTimeout(resolve, 10)); }
   }

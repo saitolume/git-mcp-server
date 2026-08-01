@@ -86,6 +86,22 @@ class AfterPushActionRunner extends GitRunner {
   }
 }
 
+class BeforePushActionRunner extends GitRunner {
+  readonly commands: GitCommand[] = [];
+  private acted = false;
+  constructor(private readonly delegate: GitRunner, private readonly action: () => Promise<void>) {
+    super(process.execPath, process.env);
+  }
+  override async run(command: GitCommand, signal?: AbortSignal): Promise<GitCommandResult> {
+    this.commands.push(command);
+    if (command.args[0] === "push" && !this.acted) {
+      this.acted = true;
+      await this.action();
+    }
+    return this.delegate.run(command, signal);
+  }
+}
+
 class PushThenDiagnosticRunner extends GitRunner {
   readonly commands: GitCommand[] = [];
   constructor(private readonly delegate: GitRunner) { super(process.execPath, process.env); }
@@ -148,18 +164,26 @@ interface PushFixture {
   readonly other: string;
   readonly bare: string;
   readonly origin: string;
+  readonly redirectedBare: string;
+  readonly redirectedOrigin: string;
+  readonly redirectedContact: string;
   readonly runner: TrackingRunner;
   readonly bootstrap: GitRunner;
   readonly initial: RepositorySnapshot;
 }
 
-async function fixture(t: test.TestContext): Promise<PushFixture> {
+async function fixture(
+  t: test.TestContext,
+  options: { readonly withRedirectedEndpoint?: boolean } = {},
+): Promise<PushFixture> {
   const root = await mkdtemp(join(tmpdir(), "git-mcp-server-push-"));
   t.after(async () => { await rm(root, { recursive: true, force: true }); });
   const bootstrap = new GitRunner(await resolveGitExecutable(), process.env);
   const local = join(root, "local");
   const other = join(root, "other");
   const bare = join(root, "remote.git");
+  const redirectedBare = join(root, "redirected.git");
+  const redirectedContact = join(root, "redirected-contact");
   const shim = join(root, "bin");
   await mkdir(local);
   await git(bootstrap, local, ["init", "--initial-branch=main"]);
@@ -169,6 +193,9 @@ async function fixture(t: test.TestContext): Promise<PushFixture> {
   await git(bootstrap, local, ["config", "core.hooksPath", ".hooks"]);
   await commit(bootstrap, local, "tracked.txt", "one\n");
   await git(bootstrap, root, ["init", "--bare", bare]);
+  if (options.withRedirectedEndpoint === true) {
+    await git(bootstrap, root, ["init", "--bare", redirectedBare]);
+  }
 
   const execPath = await git(bootstrap, root, ["--exec-path"]);
   await mkdir(shim);
@@ -180,21 +207,29 @@ async function fixture(t: test.TestContext): Promise<PushFixture> {
     + `const command = args.at(-1);\n`
     + `const host = args.at(-2);\n`
     + `const options = args.slice(0, -2).join(" ");\n`
-    + `if (host !== "git@fixture" || (options !== "" && options !== "-o SendEnv=GIT_PROTOCOL")) process.exit(90);\n`
+    + `if ((host !== "git@fixture" && host !== "git@redirected-fixture") || (options !== "" && options !== "-o SendEnv=GIT_PROTOCOL")) process.exit(90);\n`
     + `const uploadCommand = ${JSON.stringify(`git-upload-pack '${bare}'`)};\n`
     + `const receiveCommand = ${JSON.stringify(`git-receive-pack '${bare}'`)};\n`
-    + `const helper = command === uploadCommand ? ${JSON.stringify(upload)} : command === receiveCommand ? ${JSON.stringify(receive)} : null;\n`
+    + `const redirectedUploadCommand = ${JSON.stringify(`git-upload-pack '${redirectedBare}'`)};\n`
+    + `const redirectedReceiveCommand = ${JSON.stringify(`git-receive-pack '${redirectedBare}'`)};\n`
+    + `const original = host === "git@fixture" && (command === uploadCommand || command === receiveCommand);\n`
+    + `const redirected = host === "git@redirected-fixture" && (command === redirectedUploadCommand || command === redirectedReceiveCommand);\n`
+    + `const helper = original ? (command === uploadCommand ? ${JSON.stringify(upload)} : ${JSON.stringify(receive)}) : redirected ? (command === redirectedUploadCommand ? ${JSON.stringify(upload)} : ${JSON.stringify(receive)}) : null;\n`
     + `if (helper === null) process.exit(91);\n`
-    + `const child = spawnSync(helper, [${JSON.stringify(bare)}], { stdio: "inherit", env: process.env });\n`
+    + `if (redirected) require("node:fs").writeFileSync(${JSON.stringify(redirectedContact)}, "contacted\\n");\n`
+    + `const child = spawnSync(helper, [original ? ${JSON.stringify(bare)} : ${JSON.stringify(redirectedBare)}], { stdio: "inherit", env: process.env });\n`
     + `process.exit(child.status ?? 92);\n`;
   await writeFile(join(shim, "ssh"), ssh);
   await chmod(join(shim, "ssh"), 0o755);
   const runner = new TrackingRunner(await resolveGitExecutable(), { ...process.env, PATH: `${shim}${delimiter}${process.env.PATH ?? ""}` });
   const origin = `git@fixture:${bare}`;
+  const redirectedOrigin = `git@redirected-fixture:${redirectedBare}`;
   await git(runner, local, ["remote", "add", "origin", origin]);
   const initial = await inspectRepository(runner, local);
   runner.commands.length = 0;
-  return { root, local, other, bare, origin, runner, bootstrap, initial };
+  return {
+    root, local, other, bare, origin, redirectedBare, redirectedOrigin, redirectedContact, runner, bootstrap, initial,
+  };
 }
 
 async function cloneOther(value: PushFixture): Promise<void> {
@@ -304,10 +339,75 @@ test("force-with-lease replaces only the exact same-name origin branch", async (
   const pushCommands = f.runner.commands.filter(({ args }) => args[0] === "push");
   assert.equal(pushCommands.length, 1);
   assert.deepEqual(pushCommands[0]?.args, [
-    "push", `--force-with-lease=refs/heads/main:${oldRemoteHead}`, "origin", "HEAD:refs/heads/main",
+    "push", `--force-with-lease=refs/heads/main:${oldRemoteHead}`, f.origin, `${rewrittenHead}:refs/heads/main`,
   ]);
   await assert.rejects(executePreparedForcePush(f.runner, prepared), /invalid|consumed/i);
   await assert.rejects(executePreparedForcePush(f.runner, {} as PreparedForcePush), /invalid|consumed/i);
+});
+
+test("force-with-lease publishes only the prepared object when local HEAD moves before Git starts", async (t) => {
+  const f = await fixture(t);
+  await git(f.runner, f.local, ["push", "origin", "main"]);
+  const approved = await commit(f.runner, f.local, "approved.txt", "approved\n");
+  const approvedTree = await git(f.runner, f.local, ["rev-parse", `${approved}^{tree}`]);
+  const raced = await git(f.runner, f.local, ["commit-tree", approvedTree], "raced root\n");
+  const local = await inspectRepository(f.runner, f.local);
+  const statePaths = await initializeStatePaths(resolveStatePaths({
+    platform: "linux", homedir: join(f.root, "local-race-state"), env: {},
+  }));
+  const prepared = await prepareForcePushOrigin(
+    f.runner,
+    new SessionStore(statePaths),
+    local,
+    request(local, f.initial.head),
+  );
+  const runner = new BeforePushActionRunner(f.runner, async () => {
+    await git(f.runner, f.local, ["update-ref", "refs/heads/main", raced, approved]);
+  });
+
+  let caught: unknown;
+  try { await executePreparedForcePush(runner, prepared); } catch (error) { caught = error; }
+
+  assert.equal(proven(caught).result.status, "indeterminate");
+  assert.equal(await git(f.runner, f.bare, ["rev-parse", "refs/heads/main"]), approved);
+  assert.notEqual(await git(f.runner, f.bare, ["rev-parse", "refs/heads/main"]), raced);
+  assert.deepEqual(runner.commands[0]?.args, [
+    "push", `--force-with-lease=refs/heads/main:${f.initial.head}`, f.origin, `${approved}:refs/heads/main`,
+  ]);
+});
+
+test("force-with-lease uses only the prepared endpoint when origin and pushurl change before Git starts", async (t) => {
+  const f = await fixture(t, { withRedirectedEndpoint: true });
+  await git(f.runner, f.local, ["push", "origin", "main"]);
+  const approved = await commit(f.runner, f.local, "approved-endpoint.txt", "approved endpoint\n");
+  const local = await inspectRepository(f.runner, f.local);
+  const statePaths = await initializeStatePaths(resolveStatePaths({
+    platform: "linux", homedir: join(f.root, "endpoint-race-state"), env: {},
+  }));
+  const prepared = await prepareForcePushOrigin(
+    f.runner,
+    new SessionStore(statePaths),
+    local,
+    request(local, f.initial.head),
+  );
+  const runner = new BeforePushActionRunner(f.runner, async () => {
+    await git(f.runner, f.local, ["remote", "set-url", "origin", f.redirectedOrigin]);
+    await git(f.runner, f.local, ["remote", "set-url", "--push", "origin", f.redirectedOrigin]);
+  });
+
+  let caught: unknown;
+  try { await executePreparedForcePush(runner, prepared); } catch (error) { caught = error; }
+
+  assert.equal(proven(caught).result.status, "indeterminate");
+  assert.equal(await git(f.runner, f.bare, ["rev-parse", "refs/heads/main"]), approved);
+  assert.equal(await hasRef(f.bootstrap, f.redirectedBare, "refs/heads/main"), false);
+  await assert.rejects(access(f.redirectedContact));
+  assert.deepEqual(runner.commands[0]?.args, [
+    "push",
+    `--force-with-lease=refs/heads/main:${f.initial.head}`,
+    f.origin,
+    `${approved}:refs/heads/main`,
+  ]);
 });
 
 test("force-with-lease durably replays observed evidence without a second push", async (t) => {
@@ -462,7 +562,7 @@ test("force-with-lease cannot publish tags or delete another remote branch", asy
   assert.equal(await hasRef(f.runner, f.bare, "refs/tags/local-only"), false);
   const mutation = f.runner.commands.find(({ args }) => args[0] === "push");
   assert.deepEqual(mutation?.args, [
-    "push", `--force-with-lease=refs/heads/main:${f.initial.head}`, "origin", "HEAD:refs/heads/main",
+    "push", `--force-with-lease=refs/heads/main:${f.initial.head}`, f.origin, `${rewrittenHead}:refs/heads/main`,
   ]);
 });
 
@@ -587,7 +687,7 @@ test("force-with-lease exact CAS refuses an advance after preparation", async (t
   assert.equal(outcome.error?.code, "OPERATION_INDETERMINATE");
   assert.equal(await git(f.runner, f.bare, ["rev-parse", "refs/heads/main"]), advanced);
   assert.deepEqual(f.runner.commands[0]?.args, [
-    "push", `--force-with-lease=refs/heads/main:${oldRemoteHead}`, "origin", "HEAD:refs/heads/main",
+    "push", `--force-with-lease=refs/heads/main:${oldRemoteHead}`, f.origin, `${local.head}:refs/heads/main`,
   ]);
 });
 
@@ -605,7 +705,7 @@ test("push origin creates an expected-absent branch through one opaque exact lea
 
   const execution = await executePreparedPush(f.runner, prepared);
   assert.deepEqual(f.runner.commands[0]?.args, [
-    "push", "--force-with-lease=refs/heads/main:", "origin", "HEAD:refs/heads/main",
+    "push", "--force-with-lease=refs/heads/main:", f.origin, `${f.initial.head}:refs/heads/main`,
   ]);
   assert.equal(f.runner.commands.filter(({ args }) => args[0] === "push").length, 1);
   assert.equal(f.runner.commands.some(({ args }) => args.some((arg) => ["--force", "--delete", "--set-upstream", "--tags"].includes(arg))), false);
@@ -776,7 +876,7 @@ test("push origin lease rejects an ancestor advance after preparation", async (t
   assert.equal(outcome.error?.code, "OPERATION_INDETERMINATE");
   assert.equal(await git(f.runner, f.bare, ["rev-parse", "refs/heads/main"]), advanced);
   assert.deepEqual(f.runner.commands[0]?.args, [
-    "push", `--force-with-lease=refs/heads/main:${f.initial.head}`, "origin", "HEAD:refs/heads/main",
+    "push", `--force-with-lease=refs/heads/main:${f.initial.head}`, f.origin, `${local.head}:refs/heads/main`,
   ]);
 });
 
@@ -794,7 +894,7 @@ test("push origin lease rejects an expected-absence collision after preparation"
   assert.equal(outcome.error?.code, "OPERATION_INDETERMINATE");
   assert.equal(await git(f.runner, f.bare, ["rev-parse", "refs/heads/main"]), f.initial.head);
   assert.deepEqual(f.runner.commands[0]?.args, [
-    "push", "--force-with-lease=refs/heads/main:", "origin", "HEAD:refs/heads/main",
+    "push", "--force-with-lease=refs/heads/main:", f.origin, `${local.head}:refs/heads/main`,
   ]);
 });
 
@@ -876,7 +976,7 @@ test("push origin uses the canonical full branch ref despite short-name ambiguit
   f.runner.commands.length = 0;
   const execution = await executePreparedPush(f.runner, prepared);
   assert.deepEqual(f.runner.commands[0]?.args, [
-    "push", "--force-with-lease=refs/heads/heads/main:", "origin", "HEAD:refs/heads/heads/main",
+    "push", "--force-with-lease=refs/heads/heads/main:", f.origin, `${snapshot.head}:refs/heads/heads/main`,
   ]);
   assert.equal(await git(f.runner, f.bare, ["rev-parse", "refs/heads/heads/main"]), execution.data.local_head);
 });
