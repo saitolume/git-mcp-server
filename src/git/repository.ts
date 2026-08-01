@@ -37,6 +37,19 @@ function invalidRefText(value: string): boolean {
   return /[\x00-\x20\x7f~^:?*\\]/u.test(value) || value.includes("[") || !isWellFormedGitText(value);
 }
 
+/** Validates one complete native ref name without accepting revision syntax or pseudo refs. */
+export function validateFullRef(ref: string): string {
+  if (!ref.startsWith("refs/") || ref.length <= "refs/".length || ref.length > 4096
+    || !isWellFormedGitText(ref) || /[\x00-\x20\x7f~^:?*\[\\]/.test(ref) || ref.includes("..")
+    || ref.includes("@{") || ref.endsWith("/") || ref.endsWith(".")) {
+    throw new Error("ref is invalid");
+  }
+  const components = ref.split("/");
+  if (components.some((component) => component.length === 0 || component.startsWith(".")
+    || component.endsWith(".") || component.endsWith(".lock"))) throw new Error("ref is invalid");
+  return ref;
+}
+
 /** Validates a branch suffix without invoking Git and returns its canonical full ref. */
 export function canonicalBranchRef(branch: string): string {
   const ref = `refs/heads/${branch}`;

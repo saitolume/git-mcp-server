@@ -250,6 +250,15 @@ test("guarded history inputs accept only their published wire contracts", () => 
     commits: [{ commit: "b".repeat(40), message: "feat(scope): valid" }],
     destination: { mode: "current_branch" },
   }).success, true);
+  for (const [headWidth, baseWidth, commitWidth] of [
+    [40, 40, 64], [40, 64, 40], [64, 40, 64], [64, 64, 40],
+  ] as const) {
+    assert.equal(gitRewordInput.safeParse({
+      ...base, expected_head: "b".repeat(headWidth), base: "a".repeat(baseWidth),
+      commits: [{ commit: "c".repeat(commitWidth), message: "feat(scope): valid" }],
+      destination: { mode: "current_branch" },
+    }).success, false, `mixed reword input ${headWidth}/${baseWidth}/${commitWidth}`);
+  }
   assert.equal(gitRewordInput.safeParse({
     ...base,
     base: "a".repeat(40),
@@ -302,6 +311,16 @@ test("guarded history result schemas expose only the published payloads", () => 
     destination: { mode: "new_branch", branch: "reworded/history", source_branch: "feature/history" },
     trees_unchanged: true, hook: "commit-msg", signing: "disabled_by_policy",
   }).success, true);
+  for (const [baseWidth, oldHeadWidth, headWidth] of [
+    [40, 40, 64], [40, 64, 40], [40, 64, 64],
+    [64, 40, 40], [64, 40, 64], [64, 64, 40],
+  ] as const) {
+    assert.equal(rewordDataSchema.safeParse({
+      base: "a".repeat(baseWidth), old_head: "b".repeat(oldHeadWidth), head: "c".repeat(headWidth), commit_count: 1,
+      destination: { mode: "current_branch", branch: "feature/history" },
+      trees_unchanged: true, hook: "commit-msg", signing: "disabled_by_policy",
+    }).success, false, `mixed reword output ${baseWidth}/${oldHeadWidth}/${headWidth}`);
+  }
   assert.equal(commitAmendDataSchema.safeParse({
     old_commit: "a".repeat(40), commit: "b".repeat(40), old_tree: "c".repeat(40), tree: "d".repeat(40),
     hook_changed_paths: ["src/index.ts"], signing: "disabled_by_policy",

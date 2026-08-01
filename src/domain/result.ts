@@ -246,7 +246,10 @@ export const rewordDataSchema = z.strictObject({
   trees_unchanged: z.literal(true),
   hook: z.literal("commit-msg"),
   signing: z.literal("disabled_by_policy"),
-});
+}).refine(
+  ({ base, old_head, head }) => base.length === old_head.length && old_head.length === head.length,
+  "base, old_head, and head must use one object ID width",
+);
 
 export const commitAmendDataSchema = z.strictObject({
   old_commit: objectId,

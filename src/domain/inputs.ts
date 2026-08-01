@@ -186,7 +186,11 @@ export const gitRewordInput = z.strictObject({
       branch: localBranchName.describe("New canonical local branch name for the rewrite result."),
     }),
   ]).describe("Destination mode: rewrite the current branch or create a new canonical local branch."),
-});
+}).refine(
+  ({ expected_head, base, commits }) => base.length === expected_head.length
+    && commits.every(({ commit }) => commit.length === expected_head.length),
+  "expected_head, base, and every commit must use one object ID width",
+);
 
 export const gitCommitAmendInput = z.strictObject({
   ...mutationBase,

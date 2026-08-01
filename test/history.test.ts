@@ -7,11 +7,13 @@ import {
   executePreparedCommitRangeValidation,
   executePreparedReword,
   inspectLinearCommitRange,
+  parseRefLines,
   prepareCommitRangeValidation,
   prepareReword,
+  sameRefLines,
   validateMessagesWithNativeHook,
 } from "../src/git/history.js";
-import { withDeadline } from "../src/deadline.js";
+import { withDeadline, withReconciliationDeadline } from "../src/deadline.js";
 import { resolveGitExecutable } from "../src/git/environment.js";
 import { inspectRepository, type RepositorySnapshot } from "../src/git/repository.js";
 import { GitRunner, type GitCommand, type GitCommandResult, type GitStreamingCommand } from "../src/git/runner.js";
@@ -122,6 +124,25 @@ class RewordFailureRunner extends TrackingRunner {
     const result = await super.run(command, signal);
     if (this.point === "after-ref" && command.args[0] === "update-ref") throw new Error("injected after ref movement");
     return result;
+  }
+}
+
+class OwnershipBeforeRefRunner extends TrackingRunner {
+  private injected = false;
+  private readonly sideRunner: GitRunner;
+
+  constructor(executable: string, environment: NodeJS.ProcessEnv, private readonly linkedWorktree: string) {
+    super(executable, environment);
+    this.sideRunner = new GitRunner(executable, environment);
+  }
+
+  override async run(command: GitCommand, signal?: AbortSignal): Promise<GitCommandResult> {
+    if (!this.injected && command.args[0] === "update-ref" && command.args[1] === "refs/heads/feature/taken") {
+      this.injected = true;
+      await git(this.sideRunner, command.cwd, ["worktree", "add", "-b", "feature/taken", this.linkedWorktree]);
+      await git(this.sideRunner, command.cwd, ["update-ref", "-d", "refs/heads/feature/taken"]);
+    }
+    return super.run(command, signal);
   }
 }
 
@@ -282,6 +303,30 @@ test("reword validates every proposed message before creating commit objects", a
   assert.equal(runner.commands.some(({ args }) => args[0] === "update-ref"), false);
 });
 
+test("replacement ownership created by a message hook is re-proved before object creation", async (t) => {
+  const linked = await mkdtemp(join(tmpdir(), "git-mcp-server-history-hook-worktree-"));
+  await rm(linked, { recursive: true, force: true });
+  t.after(async () => { await rm(linked, { recursive: true, force: true }); });
+  const fixtureState = await fixture(t, [
+    `git worktree add -b feature/taken '${linked}' >/dev/null`,
+    "git update-ref -d refs/heads/feature/taken",
+  ].join("\n"));
+  await git(fixtureState.runner, fixtureState.directory, ["branch", "-m", "feature/source"]);
+  const runner = new TrackingRunner(await resolveGitExecutable(), process.env);
+  const before = await inspectRepository(runner, fixtureState.directory);
+  const commits = (await git(runner, fixtureState.directory, ["rev-list", "--reverse", `${fixtureState.base}..${before.head}`])).split("\n");
+  const prepared = await prepareReword(runner, fixtureState.sessions, before, {
+    expectedBranch: "feature/source", expectedHead: before.head, base: fixtureState.base,
+    commits: commits.map((commit, index) => ({ commit, message: `feat(ownership): ${index + 1}` })),
+    destination: { mode: "new_branch", branch: "feature/taken" },
+  });
+  await assert.rejects(executePreparedReword(runner, prepared), (error) => {
+    assert.equal((error as { result: { status?: string } }).result.status, "failed");
+    return true;
+  });
+  assert.equal(runner.commands.some(({ args }) => args.includes("commit-tree") || args[0] === "update-ref"), false);
+});
+
 test("post-switch hook mutation makes replacement-branch reword indeterminate", async (t) => {
   const { directory, runner, sessions, base } = await fixture(t, "exit 0");
   await git(runner, directory, ["branch", "-m", "feature/source"]);
@@ -302,6 +347,30 @@ test("post-switch hook mutation makes replacement-branch reword indeterminate", 
   });
 });
 
+test("ownership race after the final proof reconciles the visible destination ref as indeterminate", async (t) => {
+  const fixtureState = await fixture(t, "exit 0");
+  await git(fixtureState.runner, fixtureState.directory, ["branch", "-m", "feature/source"]);
+  const linked = await mkdtemp(join(tmpdir(), "git-mcp-server-history-race-worktree-"));
+  await rm(linked, { recursive: true, force: true });
+  t.after(async () => { await rm(linked, { recursive: true, force: true }); });
+  const runner = new OwnershipBeforeRefRunner(await resolveGitExecutable(), process.env, linked);
+  const before = await inspectRepository(runner, fixtureState.directory);
+  const commits = (await git(runner, fixtureState.directory, ["rev-list", "--reverse", `${fixtureState.base}..${before.head}`])).split("\n");
+  const prepared = await prepareReword(runner, fixtureState.sessions, before, {
+    expectedBranch: "feature/source", expectedHead: before.head, base: fixtureState.base,
+    commits: commits.map((commit, index) => ({ commit, message: `feat(race): ${index + 1}` })),
+    destination: { mode: "new_branch", branch: "feature/taken" },
+  });
+  await assert.rejects(executePreparedReword(runner, prepared), (error) => {
+    const result = (error as { result: { status?: string; error?: { code?: string } } }).result;
+    assert.equal(result.status, "indeterminate");
+    assert.equal(result.error?.code, "OPERATION_INDETERMINATE");
+    return true;
+  });
+  assert.notEqual(await git(runner, fixtureState.directory, ["show-ref", "--verify", "--hash", "refs/heads/feature/taken"]), before.head);
+  assert.equal((await inspectRepository(runner, fixtureState.directory)).branch, "feature/source");
+});
+
 test("replacement-branch reword rejects collisions including another worktree owner before hooks", async (t) => {
   for (const scenario of ["collision", "other-worktree"] as const) {
     await t.test(scenario, async (t) => {
@@ -314,6 +383,8 @@ test("replacement-branch reword rejects collisions including another worktree ow
         await rm(worktree, { recursive: true, force: true });
         t.after(async () => { await rm(worktree, { recursive: true, force: true }); });
         await git(fixtureState.runner, fixtureState.directory, ["worktree", "add", "-b", "feature/taken", worktree]);
+        await git(fixtureState.runner, fixtureState.directory, ["update-ref", "-d", "refs/heads/feature/taken"]);
+        assert.equal((await git(fixtureState.runner, fixtureState.directory, ["worktree", "list", "--porcelain"])).includes("branch refs/heads/feature/taken"), true);
       }
       const runner = new TrackingRunner(await resolveGitExecutable(), process.env);
       const before = await inspectRepository(runner, fixtureState.directory);
@@ -322,8 +393,8 @@ test("replacement-branch reword rejects collisions including another worktree ow
         expectedBranch: "feature/source", expectedHead: before.head, base: fixtureState.base,
         commits: commits.map((commit, index) => ({ commit, message: `feat(collision): ${index + 1}` })),
         destination: { mode: "new_branch", branch: "feature/taken" },
-      }), /already exists|destination/i);
-      assert.equal(runner.commands.some(({ args }) => args[0] === "hook" || args.includes("commit-tree")), false);
+      }), /already exists|destination|worktree/i);
+      assert.equal(runner.commands.some(({ args }) => args[0] === "hook" || args.includes("commit-tree") || args[0] === "update-ref"), false);
     });
   }
 });
@@ -488,6 +559,34 @@ test("range parser accepts only NUL-framed exact same-width IDs and the 128-comm
   const overflowRange = overflow.map((id, index) => `${index === 0 ? "" : "\n"}${id}\0${index === 0 ? base : overflow[index - 1]}\0`).join("") + "\n";
   await assert.rejects(inspectLinearCommitRange(new QueueRunner([commandResult(), commandResult({ stdout: overflowRange })]), "/repo", base, overflow.at(-1)!),
     /range|maximum|malformed/i);
+});
+
+test("complete ref comparison is linear and cooperatively bounded by reconciliation deadline", async () => {
+  const lines = Array.from({ length: 50_000 }, (_, index) => `${index.toString(16).padStart(40, "0")} refs/heads/ref-${index}`);
+  await withReconciliationDeadline(async (signal) => {
+    assert.equal(sameRefLines(lines, [...lines].reverse(), signal), true);
+  });
+  assert.equal(sameRefLines(lines, [...lines.slice(0, -1), `${"f".repeat(40)} refs/heads/different`]), false);
+  assert.equal(sameRefLines([lines[0]!, lines[0]!], [lines[0]!, lines[0]!]), false);
+
+  let now = 0;
+  await assert.rejects(withReconciliationDeadline(async (signal) => {
+    sameRefLines(lines, lines, signal);
+  }, { monotonicNow: () => { now += 10_000; return now; } }), /deadline/i);
+});
+
+test("complete ref parser requires exact repository-width object IDs and strict full refs", () => {
+  const oid40 = "a".repeat(40);
+  assert.deepEqual(parseRefLines(`${oid40} HEAD\n${oid40} refs/heads/main\n`, 40), [
+    `${oid40} HEAD`, `${oid40} refs/heads/main`,
+  ]);
+  for (const width of [39, 41, 63, 65]) {
+    assert.throws(() => parseRefLines(`${"b".repeat(width)} refs/heads/topic\n`, 40), /ref|object|width|malformed/i, `${width}`);
+  }
+  assert.throws(() => parseRefLines(`${oid40} HEAD\n${"c".repeat(64)} refs/heads/topic\n`, 40), /ref|object|width|malformed/i);
+  for (const ref of ["refs/heads/topic..bad", "refs/heads/.hidden", "refs/heads/topic.lock", "refs/heads/trailing.", "refs/heads/topic@{bad}"]) {
+    assert.throws(() => parseRefLines(`${oid40} ${ref}\n`, 40), /ref|malformed/i, ref);
+  }
 });
 
 test("range parser rejects raw invalid UTF-8 and accepts a complete 64-bit object-id family", async () => {

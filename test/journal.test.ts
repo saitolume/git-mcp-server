@@ -620,6 +620,27 @@ test("operation journal enforces the bounded commit-range validation result", as
   }
 });
 
+test("operation journal rejects mixed-width reword publication and manual replay", async (t) => {
+  const paths = await temporaryState(t);
+  const journal = new OperationJournal(paths, { now: () => timestamp, pid: 123 });
+  const request = { requestId: "reword-mixed-width", operation: "git_reword", repositoryId, input: {} };
+  await journal.begin(request);
+  const result = {
+    status: "succeeded" as const, request_id: request.requestId, repository_id: repositoryId,
+    operation: request.operation, data: {
+      base: "a".repeat(40), old_head: "b".repeat(40), head: "c".repeat(64), commit_count: 1,
+      destination: { mode: "current_branch" as const, branch: "feature/history" },
+      trees_unchanged: true as const, hook: "commit-msg" as const, signing: "disabled_by_policy" as const,
+    }, warnings: [],
+  };
+  await assert.rejects(journal.complete(request.requestId, result), /output|data|head/i);
+  assert.equal(await journal.get(request.requestId), null);
+  await writeFile(join(paths.operations, request.requestId, "result.json"), JSON.stringify({
+    requestId: request.requestId, completedAt: timestamp, result,
+  }));
+  await assert.rejects(journal.get(request.requestId), /output|data|head/i);
+});
+
 test("request-only journal state resumes execution while started state becomes durable indeterminate", async (t) => {
   const paths = await temporaryState(t);
   const journal = new OperationJournal(paths, { now: () => timestamp, pid: 123 });

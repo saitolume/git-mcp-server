@@ -8,7 +8,7 @@ import { BridgeRejection } from "../domain/result.js";
 import { OPERATION_TIMEOUT_MS } from "../product.js";
 import { validateOriginRemoteRef, type FetchRecord } from "../state/records.js";
 import type { SessionStore } from "../state/session-store.js";
-import { assertMutationReady, canonicalBranchRef, inspectRepository, type RepositorySnapshot } from "./repository.js";
+import { assertMutationReady, canonicalBranchRef, inspectRepository, validateFullRef, type RepositorySnapshot } from "./repository.js";
 import { readPushTrackedWorktreeSnapshotId } from "./read.js";
 import type { GitCommandResult, GitRunner } from "./runner.js";
 import {
@@ -333,17 +333,6 @@ export async function readOriginIdentity(
   signal?: AbortSignal,
 ): Promise<RemoteIdentity> {
   return parseAllowedRemote(await readOrigin(runner, root, signal));
-}
-
-function validateFullRef(ref: string): void {
-  if (!ref.startsWith("refs/") || ref.length <= "refs/".length || ref.length > 4096
-    || !isWellFormedGitText(ref) || /[\x00-\x20\x7f~^:?*\[\\]/.test(ref) || ref.includes("..")
-    || ref.includes("@{") || ref.endsWith("/") || ref.endsWith(".")) {
-    throw new Error("ref is invalid");
-  }
-  const components = ref.split("/");
-  if (components.some((component) => component.length === 0 || component.startsWith(".")
-    || component.endsWith(".") || component.endsWith(".lock"))) throw new Error("ref is invalid");
 }
 
 interface RefProof {
