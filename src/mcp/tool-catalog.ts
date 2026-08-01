@@ -2,6 +2,7 @@ import { z } from "zod";
 import {
   gitOperationGetInput,
   gitCommitRangeValidateInput,
+  gitRewordInput,
   gitAddInput,
   gitCommitInput,
   gitDiffInput,
@@ -32,6 +33,7 @@ import {
   switchAttachDataSchema,
   switchCreateDataSchema,
   commitRangeValidateDataSchema,
+  rewordDataSchema,
 } from "../domain/result.js";
 import { PRODUCT } from "../product.js";
 
@@ -39,7 +41,7 @@ export const TOOL_NAMES = [
   "git_status", "git_diff", "git_switch_create", "git_switch_attach", "git_add",
   "git_restore_staged", "git_restore_worktree", "git_commit", "git_fetch",
   "git_merge", "git_merge_continue", "git_merge_abort", "git_push",
-  "git_commit_range_validate",
+  "git_commit_range_validate", "git_reword",
   "git_operation_get",
 ] as const;
 
@@ -182,6 +184,13 @@ export const TOOL_CATALOG = {
     inputSchema: gitCommitRangeValidateInput,
     outputSchema: bridgeResultSchema(commitRangeValidateDataSchema),
     annotations: mutationAnnotations,
+  },
+  git_reword: {
+    title: title("Reword commit range"),
+    description: "Operation: Recreate every commit in the exact linear base..HEAD range with replacement messages after native commit-msg validation, then move one local destination with exact CAS. Returns: request_id, repository_id, old and new object IDs, count, destination, tree-invariance proof, hook kind, and signing policy. Defaults: preserve every pairwise tree, parent mapping, author, and committer; current_branch moves the checked-out ref, while new_branch creates and switches to one absent local branch. Excludes: signed or merge commits, raw Git arguments, reset, rebase, stash, hook bypass, amend, force push, and automatic retry.",
+    inputSchema: gitRewordInput,
+    outputSchema: bridgeResultSchema(rewordDataSchema),
+    annotations: destructiveMutationAnnotations,
   },
   git_operation_get: {
     title: title("Get operation"),

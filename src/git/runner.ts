@@ -12,6 +12,15 @@ export interface GitCommand {
   readonly timeoutMs: number;
   readonly maxOutputBytes: number;
   readonly stdin?: string;
+  /** Internal-only identity binding for deterministic commit object creation. */
+  readonly commitIdentity?: {
+    readonly authorName: string;
+    readonly authorEmail: string;
+    readonly authorDate: string;
+    readonly committerName: string;
+    readonly committerEmail: string;
+    readonly committerDate: string;
+  };
   /** Internal streaming hook. When present, stdout is drained here instead of retained. */
   readonly stdoutConsumer?: (chunk: Buffer) => void;
   /** Internal native-hook wrapper binding. The original hook child never inherits fd 3. */
@@ -131,7 +140,15 @@ export class GitRunner {
     const child = spawn(this.executablePath, command.args, {
       cwd: command.cwd,
       env: command.hookExecution === undefined
-        ? this.environment
+        ? command.commitIdentity === undefined ? this.environment : {
+          ...this.environment,
+          GIT_AUTHOR_NAME: assertWellFormedGitText(command.commitIdentity.authorName, "Commit author name"),
+          GIT_AUTHOR_EMAIL: assertWellFormedGitText(command.commitIdentity.authorEmail, "Commit author email"),
+          GIT_AUTHOR_DATE: assertWellFormedGitText(command.commitIdentity.authorDate, "Commit author date"),
+          GIT_COMMITTER_NAME: assertWellFormedGitText(command.commitIdentity.committerName, "Commit committer name"),
+          GIT_COMMITTER_EMAIL: assertWellFormedGitText(command.commitIdentity.committerEmail, "Commit committer email"),
+          GIT_COMMITTER_DATE: assertWellFormedGitText(command.commitIdentity.committerDate, "Commit committer date"),
+        }
         : {
           ...this.environment,
           GIT_CONFIG_COUNT: "1",

@@ -1,12 +1,12 @@
 import { createHash } from "node:crypto";
 import { remainingDeadlineTimeoutMs, withReconciliationDeadline } from "../deadline.js";
 import { assertWellFormedGitText, isWellFormedGitText } from "../domain/git-text.js";
-import { BridgeRejection, HOOK_FAILED_MESSAGE, type CommitRangeValidateData } from "../domain/result.js";
+import { BridgeRejection, HOOK_FAILED_MESSAGE, type BridgeResult, type CommitRangeValidateData, type RewordData } from "../domain/result.js";
 import { ProvenMutationOutcome } from "../app/mutation-coordinator.js";
 import { OPERATION_TIMEOUT_MS } from "../product.js";
 import type { SessionStore } from "../state/session-store.js";
 import { createHookWrappers, withNativeCommitMessageFile } from "./hook-wrapper.js";
-import { assertMutationReady, inspectRepository, type RepositorySnapshot } from "./repository.js";
+import { assertMutationReady, canonicalBranchRef, inspectRepository, type RepositorySnapshot } from "./repository.js";
 import { readStatus } from "./read.js";
 import type { GitCommandResult, GitRunner } from "./runner.js";
 
@@ -24,6 +24,16 @@ export interface CommitRangeValidationRequest {
 export interface LinearCommit {
   readonly commit: string;
   readonly message: string;
+  readonly tree: string;
+  readonly parent: string;
+  readonly author: CommitIdentity;
+  readonly committer: CommitIdentity;
+}
+
+interface CommitIdentity {
+  readonly name: string;
+  readonly email: string;
+  readonly date: string;
 }
 
 export interface PreparedCommitRangeValidation {
@@ -173,6 +183,12 @@ async function readNulLinearRange(
   return commits;
 }
 
+function parseIdentity(value: string): CommitIdentity {
+  const match = /^([^<>\n]+) <([^<>\n]+)> ([0-9]+ [+-][0-9]{4})$/.exec(value);
+  if (match === null || match[1]!.endsWith(" ")) reject("UNSUPPORTED_REPOSITORY_STATE", "Commit contains unsupported identity metadata");
+  return Object.freeze({ name: match[1]!, email: match[2]!, date: match[3]! });
+}
+
 function parseCommitObject(commit: string, object: string, expectedParent: string, width: number): LinearCommit {
   if (!isWellFormedGitText(object) || object.includes("\0")) {
     reject("UNSUPPORTED_REPOSITORY_STATE", "Commit message is not well-formed UTF-8");
@@ -184,6 +200,8 @@ function parseCommitObject(commit: string, object: string, expectedParent: strin
   const seen = new Set<string>();
   let parent: string | undefined;
   let tree: string | undefined;
+  let author: CommitIdentity | undefined;
+  let committer: CommitIdentity | undefined;
   for (const header of headers) {
     const space = header.indexOf(" ");
     const name = space > 0 ? header.slice(0, space) : "";
@@ -195,11 +213,13 @@ function parseCommitObject(commit: string, object: string, expectedParent: strin
     seen.add(name);
     if (name === "parent") parent = emittedObjectId(value, "Commit parent", width);
     if (name === "tree") tree = emittedObjectId(value, "Commit tree", width);
+    if (name === "author") author = parseIdentity(value);
+    if (name === "committer") committer = parseIdentity(value);
   }
-  if (!seen.has("tree") || tree === undefined || !seen.has("parent") || !seen.has("author") || !seen.has("committer") || parent !== expectedParent) {
+  if (!seen.has("tree") || tree === undefined || !seen.has("parent") || author === undefined || committer === undefined || parent !== expectedParent) {
     reject("UNSUPPORTED_REPOSITORY_STATE", "Commit parent does not match the exact requested range");
   }
-  return { commit, message };
+  return Object.freeze({ commit, message, tree, parent, author, committer });
 }
 
 /** Inspects only literal object IDs and returns the ordered messages of a bounded linear range. */
@@ -237,20 +257,28 @@ async function readHooksPath(runner: GitRunner, root: string, signal?: AbortSign
 }
 
 async function readRefFingerprint(runner: GitRunner, root: string, signal?: AbortSignal): Promise<string> {
+  const lines = await readRefLines(runner, root, signal);
+  const hash = createHash("sha256").update("git-mcp-server:refs:v1\0");
+  for (const line of lines) hash.update(Buffer.from(line)).update("\0");
+  return hash.digest("hex");
+}
+
+async function readRefLines(runner: GitRunner, root: string, signal?: AbortSignal): Promise<readonly string[]> {
   const result = await runner.run({
     cwd: root, args: ["show-ref", "--head", "--dereference"],
     timeoutMs: remainingDeadlineTimeoutMs(OPERATION_TIMEOUT_MS.read), maxOutputBytes: REF_OUTPUT_LIMIT,
   }, signal);
   if (!complete(result) || !isWellFormedGitText(result.stdout)) throw new Error("Unable to prove repository refs");
-  const hash = createHash("sha256").update("git-mcp-server:refs:v1\0");
+  const lines: string[] = [];
   for (const line of result.stdout.split("\n")) {
     if (line.length === 0) continue;
     if (Buffer.byteLength(line, "utf8") > 16 * 1024 || !/^[0-9a-f]{40,64} (?:HEAD|refs\/[A-Za-z0-9._/{}@+-]+(?:\^\{\})?)$/.test(line)) {
       throw new Error("Git returned malformed refs");
     }
-    hash.update(Buffer.from(line)).update("\0");
+    lines.push(line);
   }
-  return hash.digest("hex");
+  if (new Set(lines).size !== lines.length) throw new Error("Git returned duplicate refs");
+  return Object.freeze(lines);
 }
 
 async function cleanStatus(runner: GitRunner, snapshot: RepositorySnapshot, signal?: AbortSignal): Promise<string> {
@@ -430,4 +458,292 @@ export async function executePreparedCommitRangeValidation(
     });
   }
   return { base: state.base, head: state.snapshot.head, commit_count: state.commits.length, hook: "commit-msg" };
+}
+
+export interface RewordRequest {
+  readonly expectedBranch: string;
+  readonly expectedHead: string;
+  readonly base: string;
+  readonly commits: readonly { readonly commit: string; readonly message: string }[];
+  readonly destination: { readonly mode: "current_branch" }
+    | { readonly mode: "new_branch"; readonly branch: string };
+}
+
+export interface PreparedReword {
+  readonly base: string;
+  readonly oldHead: string;
+  readonly commitCount: number;
+}
+
+export interface RewordExecutionOutcome {
+  readonly data: RewordData;
+  readonly warnings: readonly string[];
+  readonly observation: Readonly<Record<string, unknown>>;
+}
+
+interface PreparedRewordState extends PreparedState {
+  readonly replacements: readonly string[];
+  readonly destination: RewordRequest["destination"];
+  readonly destinationRef: string;
+  readonly refLines: readonly string[];
+}
+
+const preparedRewords = new WeakMap<PreparedReword, PreparedRewordState>();
+
+function sameCommits(left: readonly LinearCommit[], right: readonly LinearCommit[]): boolean {
+  return left.length === right.length && left.every((entry, index) => {
+    const other = right[index];
+    return other !== undefined && entry.commit === other.commit && entry.message === other.message
+      && entry.tree === other.tree && entry.parent === other.parent
+      && entry.author.name === other.author.name && entry.author.email === other.author.email && entry.author.date === other.author.date
+      && entry.committer.name === other.committer.name && entry.committer.email === other.committer.email
+      && entry.committer.date === other.committer.date;
+  });
+}
+
+async function assertNewBranchAbsent(
+  runner: GitRunner,
+  snapshot: RepositorySnapshot,
+  branch: string,
+  branchRef: string,
+  signal?: AbortSignal,
+): Promise<void> {
+  const checked = await runRead(runner, snapshot.root, ["check-ref-format", "--branch", branch], signal);
+  if (!ordinaryFailure(checked) && !complete(checked)) reject("UNSUPPORTED_REPOSITORY_STATE", "Unable to validate the destination branch");
+  if (!complete(checked) || checked.stdout !== branch + "\n") reject("INVALID_INPUT", "Destination branch name is invalid");
+  const existing = await runRead(runner, snapshot.root, ["show-ref", "--verify", "--quiet", branchRef], signal);
+  if (complete(existing)) reject("INVALID_INPUT", "Destination local branch already exists");
+  if (!ordinaryFailure(existing) || existing.exitCode !== 1 || existing.stdout !== "" || existing.stderr !== "") {
+    reject("UNSUPPORTED_REPOSITORY_STATE", "Unable to prove the destination branch is absent");
+  }
+}
+
+/** Performs every rejection-capable reword check before native hooks or object creation. */
+export async function prepareReword(
+  runner: GitRunner,
+  sessions: SessionStore,
+  snapshot: RepositorySnapshot,
+  input: RewordRequest,
+  signal?: AbortSignal,
+): Promise<PreparedReword> {
+  const base = exactObjectId(input.base, "Base");
+  exactObjectId(input.expectedHead, "Expected head", base.length);
+  if (input.commits.length === 0 || input.commits.length > RANGE_LIMIT) reject("INVALID_INPUT", "Reword requires 1 through 128 commits");
+  const replacements = input.commits.map((entry) => {
+    exactObjectId(entry.commit, "Reword commit", base.length);
+    assertWellFormedGitText(entry.message, "Commit message");
+    if (entry.message.length === 0 || entry.message.length > 100_000) reject("INVALID_INPUT", "Commit message length is invalid");
+    return entry.message;
+  });
+
+  const before = await inspectRepository(runner, snapshot.root, signal);
+  assertIdentity(snapshot, before);
+  assertMutationReady(before, input.expectedBranch, input.expectedHead);
+  await sessions.assertNoActiveSession(before.repositoryId);
+  const worktreeSnapshotId = await cleanStatus(runner, before, signal);
+  const commits = await inspectLinearCommitRange(runner, before.root, base, before.head, signal);
+  if (commits.length !== input.commits.length || commits.some((entry, index) => entry.commit !== input.commits[index]?.commit)) {
+    reject("INVALID_INPUT", "Reword commits must exactly cover the ordered linear range");
+  }
+  const hooksPath = await readHooksPath(runner, before.root, signal);
+  const refsFingerprint = await readRefFingerprint(runner, before.root, signal);
+  const refLines = await readRefLines(runner, before.root, signal);
+  let destinationRef = before.branchRef!;
+  if (input.destination.mode === "new_branch") {
+    try { destinationRef = canonicalBranchRef(input.destination.branch); }
+    catch { reject("INVALID_INPUT", "Destination branch name is invalid"); }
+    await assertNewBranchAbsent(runner, before, input.destination.branch, destinationRef, signal);
+  }
+
+  const finalBefore = await inspectRepository(runner, before.root, signal);
+  assertIdentity(before, finalBefore);
+  assertMutationReady(finalBefore, input.expectedBranch, input.expectedHead);
+  await sessions.assertNoActiveSession(finalBefore.repositoryId);
+  if (finalBefore.indexTree !== before.indexTree || finalBefore.headTree !== before.headTree
+    || await cleanStatus(runner, finalBefore, signal) !== worktreeSnapshotId
+    || await readRefFingerprint(runner, finalBefore.root, signal) !== refsFingerprint) {
+    reject("UNSUPPORTED_REPOSITORY_STATE", "Repository changed while preparing reword");
+  }
+  const finalCommits = await inspectLinearCommitRange(runner, finalBefore.root, base, finalBefore.head, signal);
+  if (!sameCommits(commits, finalCommits)) reject("UNSUPPORTED_REPOSITORY_STATE", "Commit range changed while preparing reword");
+
+  const prepared = Object.freeze({ base, oldHead: finalBefore.head, commitCount: commits.length });
+  preparedRewords.set(prepared, {
+    snapshot: Object.freeze({ ...finalBefore }), sessions, base, commits, hooksPath, refsFingerprint,
+    worktreeSnapshotId, replacements: Object.freeze(replacements), destination: Object.freeze({ ...input.destination }),
+    destinationRef, refLines,
+  });
+  return prepared;
+}
+
+export function preparedRewordObservation(prepared: PreparedReword): Readonly<Record<string, unknown>> {
+  const state = preparedRewords.get(prepared);
+  if (state === undefined) reject("INVALID_INPUT", "Prepared reword authority is invalid or already consumed");
+  return Object.freeze({
+    branch: state.snapshot.branch!, head: state.snapshot.head, base: state.base,
+    commit_count: state.commits.length, index_tree: state.snapshot.indexTree,
+    destination: state.destination,
+  });
+}
+
+function rewordProven<T>(result: BridgeResult<T>): never {
+  throw new ProvenMutationOutcome<T>(result);
+}
+
+function sameRefLines(actual: readonly string[], expected: readonly string[]): boolean {
+  return actual.length === expected.length && actual.every((line) => expected.includes(line));
+}
+
+function expectedRewordRefLines(state: PreparedRewordState, newHead: string): readonly string[] {
+  const sourceRef = state.snapshot.branchRef!;
+  const expected = state.refLines.map((line) => {
+    if (line === `${state.snapshot.head} HEAD`) return `${newHead} HEAD`;
+    if (state.destination.mode === "current_branch" && line === `${state.snapshot.head} ${sourceRef}`) return `${newHead} ${sourceRef}`;
+    return line;
+  });
+  if (state.destination.mode === "new_branch") expected.push(`${newHead} ${state.destinationRef}`);
+  return Object.freeze(expected);
+}
+
+async function recreateCommits(
+  runner: GitRunner,
+  state: PreparedRewordState,
+  signal?: AbortSignal,
+): Promise<{ readonly head: string; readonly commits: readonly LinearCommit[] }> {
+  const recreated: LinearCommit[] = [];
+  let parent = state.base;
+  for (let index = 0; index < state.commits.length; index += 1) {
+    const source = state.commits[index]!;
+    const result = await runner.run({
+      cwd: state.snapshot.root,
+      args: ["-c", "commit.gpgSign=false", "commit-tree", source.tree, "-p", parent],
+      stdin: state.replacements[index]!,
+      timeoutMs: remainingDeadlineTimeoutMs(OPERATION_TIMEOUT_MS.commit),
+      maxOutputBytes: READ_OUTPUT_LIMIT,
+      commitIdentity: {
+        authorName: source.author.name, authorEmail: source.author.email, authorDate: source.author.date,
+        committerName: source.committer.name, committerEmail: source.committer.email, committerDate: source.committer.date,
+      },
+    }, signal);
+    if (!complete(result) || !result.stdout.endsWith("\n")) throw new Error("Git did not recreate the commit object");
+    const commit = emittedObjectId(result.stdout.slice(0, -1), "Recreated commit", state.snapshot.head.length);
+    const object = await runRead(runner, state.snapshot.root, ["--no-replace-objects", "cat-file", "commit", commit], signal);
+    if (!complete(object)) throw new Error("Unable to inspect a recreated commit");
+    const parsed = parseCommitObject(commit, object.stdout, parent, state.snapshot.head.length);
+    if (parsed.tree !== source.tree || parsed.parent !== parent || parsed.message !== state.replacements[index]
+      || parsed.author.name !== source.author.name || parsed.author.email !== source.author.email || parsed.author.date !== source.author.date
+      || parsed.committer.name !== source.committer.name || parsed.committer.email !== source.committer.email
+      || parsed.committer.date !== source.committer.date) {
+      throw new Error("Recreated commit metadata did not match the source commit");
+    }
+    recreated.push(parsed);
+    parent = commit;
+  }
+  return Object.freeze({ head: parent, commits: Object.freeze(recreated) });
+}
+
+async function proveRewordSuccess(
+  runner: GitRunner,
+  state: PreparedRewordState,
+  newHead: string,
+): Promise<RewordExecutionOutcome | null> {
+  const after = await inspectRepository(runner, state.snapshot.root);
+  assertIdentity(state.snapshot, after);
+  const destinationBranch = state.destination.mode === "current_branch" ? state.snapshot.branch! : state.destination.branch;
+  if (after.branch !== destinationBranch || after.branchRef !== state.destinationRef || after.head !== newHead
+    || after.operationState !== "none" || !after.indexMatchesHead || after.indexTree !== state.snapshot.indexTree
+    || after.headTree !== state.snapshot.headTree) return null;
+  await cleanStatus(runner, after);
+  if (!sameRefLines(await readRefLines(runner, after.root), expectedRewordRefLines(state, newHead))) return null;
+  const commits = await inspectLinearCommitRange(runner, after.root, state.base, newHead);
+  if (commits.length !== state.commits.length || commits.some((entry, index) => {
+    const source = state.commits[index]!;
+    return entry.tree !== source.tree || entry.parent !== (index === 0 ? state.base : commits[index - 1]!.commit)
+      || entry.author.name !== source.author.name || entry.author.email !== source.author.email || entry.author.date !== source.author.date
+      || entry.committer.name !== source.committer.name || entry.committer.email !== source.committer.email
+      || entry.committer.date !== source.committer.date || entry.message !== state.replacements[index];
+  })) return null;
+  const data: RewordData = {
+    base: state.base, old_head: state.snapshot.head, head: newHead, commit_count: commits.length,
+    destination: state.destination.mode === "current_branch"
+      ? { mode: "current_branch", branch: state.snapshot.branch! }
+      : { mode: "new_branch", branch: state.destination.branch, source_branch: state.snapshot.branch! },
+    trees_unchanged: true, hook: "commit-msg", signing: "disabled_by_policy",
+  };
+  return {
+    data, warnings: Object.freeze([]),
+    observation: Object.freeze({ branch: after.branch, head: after.head, index_tree: after.indexTree, base: state.base }),
+  };
+}
+
+/** Recreates and pairwise proves every commit before exact CAS ref movement. */
+export async function executePreparedReword(
+  runner: GitRunner,
+  prepared: PreparedReword,
+  signal?: AbortSignal,
+): Promise<RewordExecutionOutcome> {
+  const state = preparedRewords.get(prepared);
+  if (state === undefined) reject("INVALID_INPUT", "Prepared reword authority is invalid or already consumed");
+  preparedRewords.delete(prepared);
+  let newHead: string | undefined;
+  let mutationCommand: GitCommandResult | undefined;
+  let executionError: unknown;
+  try {
+    await proveStillPrepared(runner, state, signal);
+    await validateMessagesWithNativeHook(
+      runner, state.snapshot.root, state.hooksPath, state.replacements, signal,
+      async () => proveUnchanged(runner, state),
+    );
+    await proveStillPrepared(runner, state, signal);
+    newHead = (await recreateCommits(runner, state, signal)).head;
+    await proveStillPrepared(runner, state, signal);
+    const oldValue = state.destination.mode === "current_branch" ? state.snapshot.head : "0".repeat(state.snapshot.head.length);
+    mutationCommand = await runner.run({
+      cwd: state.snapshot.root,
+      args: ["update-ref", state.destinationRef, newHead, oldValue],
+      timeoutMs: remainingDeadlineTimeoutMs(OPERATION_TIMEOUT_MS.commit), maxOutputBytes: READ_OUTPUT_LIMIT,
+    }, signal);
+    if (state.destination.mode === "new_branch" && complete(mutationCommand)) {
+      mutationCommand = await runner.run({
+        cwd: state.snapshot.root, args: ["switch", "--no-guess", state.destination.branch],
+        timeoutMs: remainingDeadlineTimeoutMs(OPERATION_TIMEOUT_MS.commit), maxOutputBytes: READ_OUTPUT_LIMIT,
+      }, signal);
+    }
+  } catch (error) { executionError = error; /* Reconciliation below is authoritative after any hook or Git attempt. */ }
+
+  return withReconciliationDeadline(async () => {
+    if (newHead !== undefined) {
+      try {
+        const succeeded = await proveRewordSuccess(runner, state, newHead);
+        if (succeeded !== null) {
+          if (mutationCommand === undefined || !complete(mutationCommand)) {
+            return { ...succeeded, warnings: Object.freeze(["Git completion diagnostics were incomplete after reword success was proven"]) };
+          }
+          return succeeded;
+        }
+      } catch { /* Fall through to exact unchanged-state proof. */ }
+    }
+    try {
+      const after = await inspectRepository(runner, state.snapshot.root);
+      assertIdentity(state.snapshot, after);
+      if (after.branch === state.snapshot.branch && after.branchRef === state.snapshot.branchRef && after.head === state.snapshot.head
+        && after.indexTree === state.snapshot.indexTree && after.headTree === state.snapshot.headTree && after.indexMatchesHead
+        && after.operationState === "none" && await cleanStatus(runner, after) === state.worktreeSnapshotId
+        && sameRefLines(await readRefLines(runner, after.root), state.refLines)) {
+        if (executionError instanceof BridgeRejection && executionError.error.code === "HOOK_FAILED") {
+          rewordProven<RewordData>({ status: "failed", operation: "git_reword", warnings: [], error: executionError.error });
+        }
+        rewordProven<RewordData>({
+          status: "failed", operation: "git_reword", warnings: [],
+          error: { code: mutationCommand?.timedOut ? "GIT_TIMEOUT" : "GIT_FAILED", message: "Reword did not move a repository ref" },
+        });
+      }
+    } catch (error) {
+      if (error instanceof ProvenMutationOutcome) throw error;
+    }
+    rewordProven<RewordData>({
+      status: "indeterminate", operation: "git_reword", warnings: [],
+      error: { code: "OPERATION_INDETERMINATE", message: "The reword started but its final repository state could not be confirmed" },
+    });
+  });
 }

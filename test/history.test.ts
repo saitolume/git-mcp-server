@@ -5,8 +5,10 @@ import { join } from "node:path";
 import test from "node:test";
 import {
   executePreparedCommitRangeValidation,
+  executePreparedReword,
   inspectLinearCommitRange,
   prepareCommitRangeValidation,
+  prepareReword,
   validateMessagesWithNativeHook,
 } from "../src/git/history.js";
 import { withDeadline } from "../src/deadline.js";
@@ -109,6 +111,20 @@ class ThrowAfterHookRunner extends TrackingRunner {
   }
 }
 
+class RewordFailureRunner extends TrackingRunner {
+  constructor(executable: string, environment: NodeJS.ProcessEnv, private readonly point: "commit-tree" | "before-ref" | "after-ref") {
+    super(executable, environment);
+  }
+
+  override async run(command: GitCommand, signal?: AbortSignal): Promise<GitCommandResult> {
+    if (this.point === "commit-tree" && command.args.includes("commit-tree")) throw new Error("injected before object creation");
+    if (this.point === "before-ref" && command.args[0] === "update-ref") throw new Error("injected before ref movement");
+    const result = await super.run(command, signal);
+    if (this.point === "after-ref" && command.args[0] === "update-ref") throw new Error("injected after ref movement");
+    return result;
+  }
+}
+
 function assertGenericMutationFailure(error: unknown): true {
   const result = (error as { result: { error?: unknown } }).result;
   assert.deepEqual(result.error, { code: "GIT_FAILED", message: "Native commit-msg hook changed the repository" });
@@ -128,6 +144,188 @@ test("validates every commit in an exact linear range", async (t) => {
   assert.deepEqual(await executePreparedCommitRangeValidation(runner, prepared), {
     base, head: head.head, commit_count: 2, hook: "commit-msg",
   });
+});
+
+test("rewords the current branch with pairwise tree invariance", async (t) => {
+  const { directory, runner, sessions, base, head } = await fixture(t, "exit 0");
+  await git(runner, directory, ["branch", "-m", "feature/history"]);
+  const before = await inspectRepository(runner, directory);
+  const oldCommits = (await git(runner, directory, ["rev-list", "--reverse", `${base}..${before.head}`])).split("\n");
+  const describe = async (commits: readonly string[]) => Promise.all(commits.map(async (commit) =>
+    (await git(runner, directory, ["show", "-s", "--format=%T%x00%an%x00%ae%x00%aI%x00%cn%x00%ce%x00%cI", commit])).split("\0")));
+  const oldMetadata = await describe(oldCommits);
+  const oldTrees = oldMetadata.map(([tree]) => tree);
+  const oldAuthors = oldMetadata.map(([, name, email, date]) => [name, email, date]);
+  const oldCommitters = oldMetadata.map(([, , , , name, email, date]) => [name, email, date]);
+  const worktreeSnapshotBefore = await git(runner, directory, ["hash-object", "tracked.txt"]);
+
+  const prepared = await prepareReword(runner, sessions, before, {
+    expectedBranch: "feature/history",
+    expectedHead: before.head,
+    base,
+    commits: [
+      { commit: oldCommits[0]!, message: "feat(first): reworded one" },
+      { commit: oldCommits[1]!, message: "fix(second): reworded two" },
+    ],
+    destination: { mode: "current_branch" },
+  });
+  const result = await executePreparedReword(runner, prepared);
+  const after = await inspectRepository(runner, directory);
+  const newCommits = (await git(runner, directory, ["rev-list", "--reverse", `${base}..${after.head}`])).split("\n");
+  const newMetadata = await describe(newCommits);
+  const newTrees = newMetadata.map(([tree]) => tree);
+  const newAuthors = newMetadata.map(([, name, email, date]) => [name, email, date]);
+  const newCommitters = newMetadata.map(([, , , , name, email, date]) => [name, email, date]);
+
+  assert.equal(after.branch, "feature/history");
+  assert.equal(after.head, result.data.head);
+  assert.equal((await runner.run({ cwd: directory, args: ["cat-file", "-e", `${head.head}^{commit}`], timeoutMs: 10_000, maxOutputBytes: 64_000 })).exitCode, 0);
+  assert.deepEqual(newTrees, oldTrees);
+  assert.deepEqual(newAuthors, oldAuthors);
+  assert.deepEqual(newCommitters, oldCommitters);
+  assert.equal(await git(runner, directory, ["hash-object", "tracked.txt"]), worktreeSnapshotBefore);
+  assert.equal(after.indexTree, before.indexTree);
+});
+
+test("rewords onto a new branch while preserving the source ref and worktree", async (t) => {
+  const { directory, runner, sessions, base } = await fixture(t, "exit 0");
+  await git(runner, directory, ["branch", "-m", "feature/source"]);
+  const before = await inspectRepository(runner, directory);
+  const sourceHead = await git(runner, directory, ["show-ref", "--verify", "--hash", "refs/heads/feature/source"]);
+  const commits = (await git(runner, directory, ["rev-list", "--reverse", `${base}..${before.head}`])).split("\n");
+  const worktreeBefore = await git(runner, directory, ["hash-object", "tracked.txt"]);
+
+  const prepared = await prepareReword(runner, sessions, before, {
+    expectedBranch: "feature/source", expectedHead: before.head, base,
+    commits: commits.map((commit, index) => ({ commit, message: `feat(reword): replacement ${index + 1}\n` })),
+    destination: { mode: "new_branch", branch: "feature/reworded" },
+  });
+  const result = await executePreparedReword(runner, prepared);
+  const after = await inspectRepository(runner, directory);
+
+  assert.equal(after.branch, "feature/reworded");
+  assert.equal(after.head, result.data.head);
+  assert.equal(await git(runner, directory, ["show-ref", "--verify", "--hash", "refs/heads/feature/source"]), sourceHead);
+  assert.equal(await git(runner, directory, ["show-ref", "--verify", "--hash", "refs/heads/feature/reworded"]), result.data.head);
+  assert.equal(await git(runner, directory, ["hash-object", "tracked.txt"]), worktreeBefore);
+  assert.equal(after.indexTree, before.indexTree);
+});
+
+test("reword interruption is failed before ref movement and reconciled after exact ref movement", async (t) => {
+  for (const point of ["commit-tree", "before-ref", "after-ref"] as const) {
+    await t.test(point, async (t) => {
+      const fixtureState = await fixture(t, "exit 0");
+      await git(fixtureState.runner, fixtureState.directory, ["branch", "-m", "feature/history"]);
+      const runner = new RewordFailureRunner(await resolveGitExecutable(), process.env, point);
+      const before = await inspectRepository(runner, fixtureState.directory);
+      const commits = (await git(runner, fixtureState.directory, ["rev-list", "--reverse", `${fixtureState.base}..${before.head}`])).split("\n");
+      const prepared = await prepareReword(runner, fixtureState.sessions, before, {
+        expectedBranch: "feature/history", expectedHead: before.head, base: fixtureState.base,
+        commits: commits.map((commit, index) => ({ commit, message: `feat(interrupt): ${index + 1}\n` })),
+        destination: { mode: "current_branch" },
+      });
+      if (point === "after-ref") {
+        const outcome = await executePreparedReword(runner, prepared);
+        assert.notEqual(outcome.data.head, before.head);
+        assert.deepEqual(outcome.warnings, ["Git completion diagnostics were incomplete after reword success was proven"]);
+      } else {
+        await assert.rejects(executePreparedReword(runner, prepared), (error) => {
+          const result = (error as { result: { status?: string; error?: { code?: string } } }).result;
+          assert.equal(result.status, "failed");
+          assert.equal(result.error?.code, "GIT_FAILED");
+          return true;
+        });
+        assert.equal((await inspectRepository(runner, fixtureState.directory)).head, before.head);
+      }
+    });
+  }
+});
+
+test("reference-transaction rejection leaves the current branch at its old head", async (t) => {
+  const { directory, runner, sessions, base } = await fixture(t, "exit 0");
+  await git(runner, directory, ["branch", "-m", "feature/history"]);
+  await writeFile(join(directory, ".hooks", "reference-transaction"), "#!/bin/sh\n[ \"$1\" != prepared ]\n");
+  await chmod(join(directory, ".hooks", "reference-transaction"), 0o755);
+  const before = await inspectRepository(runner, directory);
+  const commits = (await git(runner, directory, ["rev-list", "--reverse", `${base}..${before.head}`])).split("\n");
+  const prepared = await prepareReword(runner, sessions, before, {
+    expectedBranch: "feature/history", expectedHead: before.head, base,
+    commits: commits.map((commit, index) => ({ commit, message: `feat(ref-hook): ${index + 1}\n` })),
+    destination: { mode: "current_branch" },
+  });
+  await assert.rejects(executePreparedReword(runner, prepared), (error) => {
+    assert.equal((error as { result: { status?: string } }).result.status, "failed");
+    return true;
+  });
+  assert.equal((await inspectRepository(runner, directory)).head, before.head);
+});
+
+test("reword validates every proposed message before creating commit objects", async (t) => {
+  const fixtureState = await fixture(t, "grep -q 'rejected' \"$1\" && exit 17\nexit 0");
+  await git(fixtureState.runner, fixtureState.directory, ["branch", "-m", "feature/history"]);
+  const runner = new TrackingRunner(await resolveGitExecutable(), process.env);
+  const before = await inspectRepository(runner, fixtureState.directory);
+  const commits = (await git(runner, fixtureState.directory, ["rev-list", "--reverse", `${fixtureState.base}..${before.head}`])).split("\n");
+  const prepared = await prepareReword(runner, fixtureState.sessions, before, {
+    expectedBranch: "feature/history", expectedHead: before.head, base: fixtureState.base,
+    commits: [
+      { commit: commits[0]!, message: "feat(valid): accepted" },
+      { commit: commits[1]!, message: "fix(rejected): denied" },
+    ],
+    destination: { mode: "current_branch" },
+  });
+  await assert.rejects(executePreparedReword(runner, prepared), (error) => {
+    assert.equal((error as { result: { error?: { code?: string } } }).result.error?.code, "HOOK_FAILED");
+    return true;
+  });
+  assert.equal(runner.commands.some(({ args }) => args.includes("commit-tree")), false);
+  assert.equal(runner.commands.some(({ args }) => args[0] === "update-ref"), false);
+});
+
+test("post-switch hook mutation makes replacement-branch reword indeterminate", async (t) => {
+  const { directory, runner, sessions, base } = await fixture(t, "exit 0");
+  await git(runner, directory, ["branch", "-m", "feature/source"]);
+  await writeFile(join(directory, ".hooks", "post-checkout"), "#!/bin/sh\nprintf 'hook mutation\\n' > tracked.txt\n");
+  await chmod(join(directory, ".hooks", "post-checkout"), 0o755);
+  const before = await inspectRepository(runner, directory);
+  const commits = (await git(runner, directory, ["rev-list", "--reverse", `${base}..${before.head}`])).split("\n");
+  const prepared = await prepareReword(runner, sessions, before, {
+    expectedBranch: "feature/source", expectedHead: before.head, base,
+    commits: commits.map((commit, index) => ({ commit, message: `feat(post-checkout): ${index + 1}\n` })),
+    destination: { mode: "new_branch", branch: "feature/reworded" },
+  });
+  await assert.rejects(executePreparedReword(runner, prepared), (error) => {
+    const result = (error as { result: { status?: string; error?: { code?: string } } }).result;
+    assert.equal(result.status, "indeterminate");
+    assert.equal(result.error?.code, "OPERATION_INDETERMINATE");
+    return true;
+  });
+});
+
+test("replacement-branch reword rejects collisions including another worktree owner before hooks", async (t) => {
+  for (const scenario of ["collision", "other-worktree"] as const) {
+    await t.test(scenario, async (t) => {
+      const fixtureState = await fixture(t, "exit 0");
+      await git(fixtureState.runner, fixtureState.directory, ["branch", "-m", "feature/source"]);
+      if (scenario === "collision") {
+        await git(fixtureState.runner, fixtureState.directory, ["branch", "feature/taken"]);
+      } else {
+        const worktree = await mkdtemp(join(tmpdir(), "git-mcp-server-history-worktree-"));
+        await rm(worktree, { recursive: true, force: true });
+        t.after(async () => { await rm(worktree, { recursive: true, force: true }); });
+        await git(fixtureState.runner, fixtureState.directory, ["worktree", "add", "-b", "feature/taken", worktree]);
+      }
+      const runner = new TrackingRunner(await resolveGitExecutable(), process.env);
+      const before = await inspectRepository(runner, fixtureState.directory);
+      const commits = (await git(runner, fixtureState.directory, ["rev-list", "--reverse", `${fixtureState.base}..${before.head}`])).split("\n");
+      await assert.rejects(prepareReword(runner, fixtureState.sessions, before, {
+        expectedBranch: "feature/source", expectedHead: before.head, base: fixtureState.base,
+        commits: commits.map((commit, index) => ({ commit, message: `feat(collision): ${index + 1}` })),
+        destination: { mode: "new_branch", branch: "feature/taken" },
+      }), /already exists|destination/i);
+      assert.equal(runner.commands.some(({ args }) => args[0] === "hook" || args.includes("commit-tree")), false);
+    });
+  }
 });
 
 test("reports only HOOK_FAILED when the second range message is rejected", async (t) => {
@@ -468,4 +666,24 @@ test("service durably replays the generic mutation-precedence failure without pr
   const encoded = JSON.stringify({ result, stored, reused });
   assert.doesNotMatch(encoded, new RegExp(`${secret}|stdout|stderr|exit|git-mcp-server-commit-msg-|hook-mutated|feat\\(first\\)|fix\\(second\\)`, "i"));
   assert.equal(result.error?.details, undefined);
+});
+
+test("service durably replays a proven current-branch reword without repeating mutation", async (t) => {
+  const { directory, paths, base, head, runner } = await fixture(t, "exit 0");
+  await git(runner, directory, ["branch", "-m", "feature/history"]);
+  const before = await inspectRepository(runner, directory);
+  const commits = (await git(runner, directory, ["rev-list", "--reverse", `${base}..${before.head}`])).split("\n");
+  const runtime = await createBridgeRuntime(paths);
+  const input = {
+    repository: directory, request_id: "b2326b9a-5e56-4d1b-b1e2-2d6f27602300",
+    expected_branch: "feature/history", expected_head: before.head, base,
+    commits: commits.map((commit, index) => ({ commit, message: `feat(replay): message ${index + 1}\n` })),
+    destination: { mode: "current_branch" as const },
+  };
+  const result = await runtime.service.git_reword(input);
+  assert.equal(result.status, "succeeded");
+  assert.equal(result.data?.old_head, head.head);
+  assert.deepEqual(await runtime.service.git_reword(input), result);
+  assert.equal((await runtime.service.git_reword({ ...input, base: "a".repeat(40) })).error?.code, "REQUEST_ID_REUSED");
+  assert.deepEqual((await runtime.journal.get(input.request_id))?.result, result);
 });

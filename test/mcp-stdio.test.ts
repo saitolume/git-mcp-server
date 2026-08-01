@@ -24,6 +24,7 @@ const EXPECTED_TOOLS = [
   ["git_merge_abort", "git-mcp-server: Abort merge", { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false }],
   ["git_push", "git-mcp-server: Push branch", { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true }],
   ["git_commit_range_validate", "git-mcp-server: Validate commit range", { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false }],
+  ["git_reword", "git-mcp-server: Reword commit range", { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false }],
   ["git_operation_get", "git-mcp-server: Get operation", { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false }],
 ] as const;
 

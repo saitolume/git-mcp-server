@@ -4,14 +4,14 @@ import type {
   GitOperationGetInput, GitAddInput, GitCommitInput, GitDiffInput, GitFetchInput,
   GitMergeAbortInput, GitMergeContinueInput, GitMergeInput, GitPushInput,
   GitRestoreStagedInput, GitRestoreWorktreeInput, GitStatusInput, GitSwitchAttachInput, GitSwitchCreateInput,
-  GitCommitRangeValidateInput,
+  GitCommitRangeValidateInput, GitRewordInput,
 } from "../domain/inputs.js";
 import {
   BridgeRejection, failure, success,
   type AddData, type BridgeResult, type CommitData, type DiffData, type FetchData,
   type MergeAbortData, type MergeContinueData, type MergeData, type PushData,
   type RestoreStagedData, type RestoreWorktreeData, type StatusData, type SwitchAttachData, type SwitchCreateData,
-  type CommitRangeValidateData,
+  type CommitRangeValidateData, type RewordData,
 } from "../domain/result.js";
 import {
   executePreparedSwitchAttach, prepareSwitchAttach, preparedSwitchAttachObservation,
@@ -41,7 +41,8 @@ import { executePreparedWorktreeRestore, prepareWorktreeRestore, type PreparedWo
 import { GitRunner } from "../git/runner.js";
 import {
   executePreparedCommitRangeValidation, prepareCommitRangeValidation, preparedCommitRangeValidationObservation,
-  type PreparedCommitRangeValidation,
+  executePreparedReword, prepareReword, preparedRewordObservation,
+  type PreparedCommitRangeValidation, type PreparedReword, type RewordExecutionOutcome,
 } from "../git/history.js";
 import {
   executePreparedAddPaths, executePreparedRestoreStaged, prepareAddPaths, prepareRestoreStaged,
@@ -80,6 +81,7 @@ export interface BridgeService {
   git_merge_abort(input: GitMergeAbortInput, signal?: AbortSignal, progress?: OperationProgress): Promise<BridgeResult<MergeAbortData>>;
   git_push(input: GitPushInput, signal?: AbortSignal, progress?: OperationProgress): Promise<BridgeResult<PushData>>;
   git_commit_range_validate(input: GitCommitRangeValidateInput, signal?: AbortSignal, progress?: OperationProgress): Promise<BridgeResult<CommitRangeValidateData>>;
+  git_reword(input: GitRewordInput, signal?: AbortSignal, progress?: OperationProgress): Promise<BridgeResult<RewordData>>;
   git_operation_get(input: GitOperationGetInput, signal?: AbortSignal, progress?: OperationProgress): Promise<BridgeResult<unknown>>;
 }
 
@@ -487,6 +489,33 @@ export class DefaultBridgeService implements BridgeService {
         mutate: async () => executePreparedCommitRangeValidation(this.dependencies.runner, prepared!, signal),
         postflight: async (value) => outputObservation(value),
         classify: (error) => classifyOperationError("git_commit_range_validate", error),
+      };
+    }, signal, progress);
+  }
+
+  git_reword(
+    input: GitRewordInput,
+    signal?: AbortSignal,
+    progress?: OperationProgress,
+  ): Promise<BridgeResult<RewordData>> {
+    return this.mutate("git_reword", input, () => {
+      let prepared: PreparedReword | undefined;
+      let outcome: RewordExecutionOutcome | undefined;
+      return {
+        preflight: async (snapshot) => {
+          prepared = await prepareReword(this.dependencies.runner, this.dependencies.sessions, snapshot, {
+            expectedBranch: input.expected_branch, expectedHead: input.expected_head, base: input.base,
+            commits: input.commits, destination: input.destination,
+          }, signal);
+          return preparedRewordObservation(prepared);
+        },
+        mutate: async () => {
+          outcome = await executePreparedReword(this.dependencies.runner, prepared!, signal);
+          return outcome.data;
+        },
+        postflight: async () => outcome?.observation ?? {},
+        warnings: () => outcome?.warnings ?? [],
+        classify: (error) => classifyOperationError("git_reword", error),
       };
     }, signal, progress);
   }
