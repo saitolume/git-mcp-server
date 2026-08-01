@@ -120,10 +120,14 @@ The native amend runs `pre-commit` and `commit-msg` hooks, preserves the current
 commit's parent set, commits exactly the owned index tree, and keeps signing
 `disabled_by_policy`. Signed current commits are rejected instead of silently
 downgraded. Hook rejection retains the stage session under the same exact index
-guards. Postflight reports the old and new commit and tree IDs, hook-created
-path evidence, signing policy, and unchanged unowned worktree state. It does
-not stage files, amend another commit, push, stash, or accept arbitrary commit
-options.
+guards. Postflight reports the old and new commit and tree IDs,
+hook-created path evidence, signing policy, and unchanged unowned worktree
+state. It does not stage files, amend another commit, push, stash, or accept
+arbitrary commit options. The private wrapper uses the bridge's absolute Git
+executable to capture native `HEAD` before the repository's
+`post-commit` hook runs. Final reconciliation requires that exact immutable
+commit object ID, covering Git's native message cleanup and every commit header
+without trusting `PATH` or a repository-controlled post-commit replacement.
 
 ### Force-with-lease delivery
 
@@ -137,6 +141,11 @@ destination is the same branch name on `origin`.
 Under the repository lock, preflight refreshes and compares the destination ref
 to the expected remote object. The native push uses an internal exact
 `--force-with-lease=<branch>:<expected>` and a fixed same-branch destination.
+Execution passes a random one-use alias to native Git and binds that alias to
+the prepared endpoint with child-only configuration. Ambient
+`url.*.pushInsteadOf` or `url.*.insteadOf` rules therefore cannot reinterpret
+the prepared endpoint after its final policy observation. The native pre-push
+hook still receives the documented `origin` name and approved endpoint.
 Caller-supplied refspecs, remote names, raw force flags, tag updates, remote
 branch deletion, and automatic retry remain outside the contract. Remote drift
 therefore rejects before replacement; after an interrupted transport, the
@@ -156,6 +165,11 @@ system authority; the bridge redacts their diagnostics but is not their
 sandbox. Repository identity, common-gitdir locking, client-generated request
 IDs, deadlines, durable replay, bounded inputs and outputs, and exact
 `observed_before`/`observed_after` reconciliation apply to every new mutation.
+Exact worktree proofs reject repositories containing `assume-unchanged` or
+`skip-worktree` index entries because Git may omit those tracked paths from
+porcelain status. The visibility map is checked before and after porcelain
+status, and status-derived content proofs inventory and hash every tracked path,
+so a visibility race cannot remove a tracked file from the proof universe.
 
 Integration coverage must exercise real native Git and hooks for accepted and
 rejected ranges, message redaction, dirty and detached repositories, active Git

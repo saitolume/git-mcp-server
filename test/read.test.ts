@@ -110,6 +110,34 @@ test("git status and both git diff modes are read-only across index and object s
   }
 });
 
+test("status rejects an index visibility change between its visibility and porcelain reads", async (t) => {
+  const { directory, runner } = await createRepository(t);
+  const snapshot = await inspectRepository(runner, directory);
+  const gitExecutable = await resolveGitExecutable();
+  class VisibilityRaceRunner extends GitRunner {
+    private triggered = false;
+
+    override async run(command: GitCommand, signal?: AbortSignal): Promise<GitCommandResult> {
+      const response = await super.run(command, signal);
+      if (!this.triggered && command.args.join(" ") === "ls-files --cached -v -z") {
+        this.triggered = true;
+        await writeFile(join(directory, "README.md"), "hidden mutation\n");
+        const hidden = await super.run({
+          cwd: directory,
+          args: ["update-index", "--assume-unchanged", "--", "README.md"],
+          timeoutMs: 10_000,
+          maxOutputBytes: 32_768,
+        });
+        assert.equal(hidden.exitCode, 0, hidden.stderr);
+      }
+      return response;
+    }
+  }
+  const racingRunner = new VisibilityRaceRunner(gitExecutable, process.env);
+
+  await assert.rejects(readStatus(racingRunner, snapshot), isRejection("UNSUPPORTED_REPOSITORY_STATE"));
+});
+
 function statusText(): string {
   return `# branch.oid ${"a".repeat(40)}\0# branch.head main\0`;
 }
@@ -565,6 +593,7 @@ test("status rejects malformed porcelain records and missing ls-files terminator
 
   const missingTerminator = new ControlledRunner((command) => command.args[0] === "status"
     ? result({ stdout: statusText() })
+    : command.args.includes("-v") ? result({ stdout: "H README.md\0" })
     : result({ stdout: `100644 ${"a".repeat(40)} 0\tREADME.md` }));
   await assert.rejects(readStatus(missingTerminator, snapshotFor(directory)), /malformed Git output: git ls-files/);
 });
@@ -589,6 +618,7 @@ test("gitlink checkout HEAD participates in the worktree snapshot", async (t) =>
   let confirmedNestedRoot = false;
   const runner = new ControlledRunner((command) => {
     if (command.args[0] === "status") return result({ stdout: statusText() });
+    if (command.args[0] === "ls-files" && command.args.includes("-v")) return result({ stdout: "H module\0" });
     if (command.args[0] === "ls-files") return result({ stdout: `160000 ${"a".repeat(40)} 0\tmodule\0` });
     if (command.args.join(" ") === "rev-parse --path-format=absolute --show-toplevel") {
       confirmedNestedRoot = true;
@@ -629,7 +659,9 @@ test("status aborts before opening an empty tracked file", async (t) => {
   const directory = await temporaryDirectory(t);
   await writeFile(join(directory, "empty.txt"), "");
   const runner = new ControlledRunner((command) => command.args[0] === "status"
-    ? result({ stdout: statusText() }) : result({ stdout: `100644 ${"a".repeat(40)} 0\tempty.txt\0` }));
+    ? result({ stdout: statusText() })
+    : command.args.includes("-v") ? result({ stdout: "H empty.txt\0" })
+    : result({ stdout: `100644 ${"a".repeat(40)} 0\tempty.txt\0` }));
   const controller = new AbortController();
   controller.abort(new Error("cancelled"));
 
@@ -655,6 +687,7 @@ test("gitlink control failures never become uninitialized or broken snapshots", 
     for (const failure of failures) {
       const runner = new ControlledRunner((command) => {
         if (command.args[0] === "status") return result({ stdout: statusText() });
+        if (command.args[0] === "ls-files" && command.args.includes("-v")) return result({ stdout: "H module\0" });
         if (command.args[0] === "ls-files") return result({ stdout: `160000 ${"a".repeat(40)} 0\tmodule\0` });
         if (command.args.join(" ") === "rev-parse --path-format=absolute --show-toplevel") {
           return phase === "top" ? failure : result({ stdout: `${join(directory, "module")}\n` });

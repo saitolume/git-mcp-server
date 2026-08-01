@@ -261,6 +261,23 @@ function request(snapshot: RepositorySnapshot, expectedRemoteHead: string | null
   return { expectedBranch: snapshot.branch!, expectedHead: snapshot.head, expectedRemoteHead };
 }
 
+function assertBoundPushCommand(
+  command: GitCommand | undefined,
+  expectedLease: string,
+  expectedEndpoint: string,
+  expectedRefspec: string,
+): void {
+  assert.ok(command);
+  const alias = command.args[2];
+  assert.match(alias ?? "", /^git-mcp-prepared:\/\/[0-9a-f-]{36}$/);
+  assert.deepEqual(command.args, ["push", expectedLease, alias, expectedRefspec]);
+  assert.deepEqual(command.hookExecution?.preparedPushEndpointBinding, {
+    alias,
+    endpoint: expectedEndpoint,
+  });
+  assert.equal(command.hookExecution?.prePushEndpoint, expectedEndpoint);
+}
+
 function rejection(error: unknown): BridgeRejection {
   assert.ok(error instanceof BridgeRejection);
   return error;
@@ -338,9 +355,8 @@ test("force-with-lease replaces only the exact same-name origin branch", async (
   assert.equal(await git(f.runner, f.bare, ["rev-parse", "refs/heads/main"]), rewrittenHead);
   const pushCommands = f.runner.commands.filter(({ args }) => args[0] === "push");
   assert.equal(pushCommands.length, 1);
-  assert.deepEqual(pushCommands[0]?.args, [
-    "push", `--force-with-lease=refs/heads/main:${oldRemoteHead}`, f.origin, `${rewrittenHead}:refs/heads/main`,
-  ]);
+  assertBoundPushCommand(pushCommands[0],
+    `--force-with-lease=refs/heads/main:${oldRemoteHead}`, f.origin, `${rewrittenHead}:refs/heads/main`);
   await assert.rejects(executePreparedForcePush(f.runner, prepared), /invalid|consumed/i);
   await assert.rejects(executePreparedForcePush(f.runner, {} as PreparedForcePush), /invalid|consumed/i);
 });
@@ -371,9 +387,8 @@ test("force-with-lease publishes only the prepared object when local HEAD moves 
   assert.equal(proven(caught).result.status, "indeterminate");
   assert.equal(await git(f.runner, f.bare, ["rev-parse", "refs/heads/main"]), approved);
   assert.notEqual(await git(f.runner, f.bare, ["rev-parse", "refs/heads/main"]), raced);
-  assert.deepEqual(runner.commands[0]?.args, [
-    "push", `--force-with-lease=refs/heads/main:${f.initial.head}`, f.origin, `${approved}:refs/heads/main`,
-  ]);
+  assertBoundPushCommand(runner.commands[0],
+    `--force-with-lease=refs/heads/main:${f.initial.head}`, f.origin, `${approved}:refs/heads/main`);
 });
 
 test("force-with-lease uses only the prepared endpoint when origin and pushurl change before Git starts", async (t) => {
@@ -417,12 +432,8 @@ test("force-with-lease uses only the prepared endpoint when origin and pushurl c
     `${approved} ${approved} refs/heads/main ${f.initial.head}`,
     "",
   ].join("\n"));
-  assert.deepEqual(runner.commands[0]?.args, [
-    "push",
-    `--force-with-lease=refs/heads/main:${f.initial.head}`,
-    f.origin,
-    `${approved}:refs/heads/main`,
-  ]);
+  assertBoundPushCommand(runner.commands[0],
+    `--force-with-lease=refs/heads/main:${f.initial.head}`, f.origin, `${approved}:refs/heads/main`);
 });
 
 test("push origin preserves its named hook contract when origin and pushurl change before Git starts", async (t) => {
@@ -458,13 +469,39 @@ test("push origin preserves its named hook contract when origin and pushurl chan
     `${approved} ${approved} refs/heads/main ${f.initial.head}`,
     "",
   ].join("\n"));
-  assert.deepEqual(runner.commands[0]?.args, [
-    "push",
-    `--force-with-lease=refs/heads/main:${f.initial.head}`,
-    f.origin,
-    `${approved}:refs/heads/main`,
-  ]);
+  assertBoundPushCommand(runner.commands[0],
+    `--force-with-lease=refs/heads/main:${f.initial.head}`, f.origin, `${approved}:refs/heads/main`);
 });
+
+for (const operation of ["normal", "force-with-lease"] as const) {
+  test(`${operation} push cannot be redirected by a late pushInsteadOf rule`, async (t) => {
+    const f = await fixture(t, { withRedirectedEndpoint: true });
+    await git(f.runner, f.local, ["push", "origin", "main"]);
+    await git(f.runner, f.local, ["push", f.redirectedOrigin, "main"]);
+    const baseline = f.initial.head;
+    const approved = await commit(f.runner, f.local, `${operation}-late-rewrite.txt`, `${operation} late rewrite\n`);
+    const local = await inspectRepository(f.runner, f.local);
+    const statePaths = await initializeStatePaths(resolveStatePaths({
+      platform: "linux", homedir: join(f.root, `${operation}-late-rewrite-state`), env: {},
+    }));
+    const prepared = operation === "normal"
+      ? await preparePushOrigin(f.runner, local, request(local, baseline))
+      : await prepareForcePushOrigin(f.runner, new SessionStore(statePaths), local, request(local, baseline));
+    const runner = new BeforePushActionRunner(f.runner, async () => {
+      await git(f.runner, f.local, ["config", `url.${f.redirectedOrigin}.pushInsteadOf`, f.origin]);
+    });
+
+    let caught: unknown;
+    try {
+      if (operation === "normal") await executePreparedPush(runner, prepared as PreparedPush);
+      else await executePreparedForcePush(runner, prepared as PreparedForcePush);
+    } catch (error) { caught = error; }
+
+    assert.equal(proven(caught).result.status, "indeterminate");
+    assert.equal(await git(f.runner, f.bare, ["rev-parse", "refs/heads/main"]), approved);
+    assert.equal(await git(f.runner, f.redirectedBare, ["rev-parse", "refs/heads/main"]), baseline);
+  });
+}
 
 test("force-with-lease durably replays observed evidence without a second push", async (t) => {
   const f = await fixture(t);
@@ -617,9 +654,8 @@ test("force-with-lease cannot publish tags or delete another remote branch", asy
   assert.equal(await git(f.runner, f.bare, ["rev-parse", "refs/heads/keep"]), f.initial.head);
   assert.equal(await hasRef(f.runner, f.bare, "refs/tags/local-only"), false);
   const mutation = f.runner.commands.find(({ args }) => args[0] === "push");
-  assert.deepEqual(mutation?.args, [
-    "push", `--force-with-lease=refs/heads/main:${f.initial.head}`, f.origin, `${rewrittenHead}:refs/heads/main`,
-  ]);
+  assertBoundPushCommand(mutation,
+    `--force-with-lease=refs/heads/main:${f.initial.head}`, f.origin, `${rewrittenHead}:refs/heads/main`);
 });
 
 test("force-with-lease runs native pre-push hooks and redacts rejection diagnostics", async (t) => {
@@ -747,9 +783,8 @@ test("force-with-lease exact CAS refuses an advance after preparation", async (t
   assert.equal(outcome.status, "indeterminate");
   assert.equal(outcome.error?.code, "OPERATION_INDETERMINATE");
   assert.equal(await git(f.runner, f.bare, ["rev-parse", "refs/heads/main"]), advanced);
-  assert.deepEqual(f.runner.commands[0]?.args, [
-    "push", `--force-with-lease=refs/heads/main:${oldRemoteHead}`, f.origin, `${local.head}:refs/heads/main`,
-  ]);
+  assertBoundPushCommand(f.runner.commands[0],
+    `--force-with-lease=refs/heads/main:${oldRemoteHead}`, f.origin, `${local.head}:refs/heads/main`);
 });
 
 test("push origin creates an expected-absent branch through one opaque exact lease", async (t) => {
@@ -765,9 +800,8 @@ test("push origin creates an expected-absent branch through one opaque exact lea
   f.runner.commands.length = 0;
 
   const execution = await executePreparedPush(f.runner, prepared);
-  assert.deepEqual(f.runner.commands[0]?.args, [
-    "push", "--force-with-lease=refs/heads/main:", f.origin, `${f.initial.head}:refs/heads/main`,
-  ]);
+  assertBoundPushCommand(f.runner.commands[0],
+    "--force-with-lease=refs/heads/main:", f.origin, `${f.initial.head}:refs/heads/main`);
   assert.equal(f.runner.commands.filter(({ args }) => args[0] === "push").length, 1);
   assert.equal(f.runner.commands.some(({ args }) => args.some((arg) => ["--force", "--delete", "--set-upstream", "--tags"].includes(arg))), false);
   assert.deepEqual(execution.data, { local_head: f.initial.head, remote_head: f.initial.head });
@@ -936,9 +970,8 @@ test("push origin lease rejects an ancestor advance after preparation", async (t
   assert.equal(outcome.status, "indeterminate");
   assert.equal(outcome.error?.code, "OPERATION_INDETERMINATE");
   assert.equal(await git(f.runner, f.bare, ["rev-parse", "refs/heads/main"]), advanced);
-  assert.deepEqual(f.runner.commands[0]?.args, [
-    "push", `--force-with-lease=refs/heads/main:${f.initial.head}`, f.origin, `${local.head}:refs/heads/main`,
-  ]);
+  assertBoundPushCommand(f.runner.commands[0],
+    `--force-with-lease=refs/heads/main:${f.initial.head}`, f.origin, `${local.head}:refs/heads/main`);
 });
 
 test("push origin lease rejects an expected-absence collision after preparation", async (t) => {
@@ -954,9 +987,8 @@ test("push origin lease rejects an expected-absence collision after preparation"
   assert.equal(outcome.status, "indeterminate");
   assert.equal(outcome.error?.code, "OPERATION_INDETERMINATE");
   assert.equal(await git(f.runner, f.bare, ["rev-parse", "refs/heads/main"]), f.initial.head);
-  assert.deepEqual(f.runner.commands[0]?.args, [
-    "push", "--force-with-lease=refs/heads/main:", f.origin, `${local.head}:refs/heads/main`,
-  ]);
+  assertBoundPushCommand(f.runner.commands[0],
+    "--force-with-lease=refs/heads/main:", f.origin, `${local.head}:refs/heads/main`);
 });
 
 test("push origin reports pre-push rejection and transport failure only after proving the remote unchanged", async (t) => {
@@ -1041,9 +1073,8 @@ test("push origin uses the canonical full branch ref despite short-name ambiguit
   const prepared = await preparePushOrigin(f.runner, snapshot, request(snapshot, null));
   f.runner.commands.length = 0;
   const execution = await executePreparedPush(f.runner, prepared);
-  assert.deepEqual(f.runner.commands[0]?.args, [
-    "push", "--force-with-lease=refs/heads/heads/main:", f.origin, `${snapshot.head}:refs/heads/heads/main`,
-  ]);
+  assertBoundPushCommand(f.runner.commands[0],
+    "--force-with-lease=refs/heads/heads/main:", f.origin, `${snapshot.head}:refs/heads/heads/main`);
   assert.equal(await git(f.runner, f.bare, ["rev-parse", "refs/heads/heads/main"]), execution.data.local_head);
 });
 

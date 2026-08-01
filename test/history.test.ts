@@ -497,6 +497,7 @@ test("wrapper setup and cleanup failures still run the mandatory proof before an
     async () => { proofs += 1; },
     async () => ({
       directory: "/private/wrappers", failureConsumer: () => {}, rejectedHook: () => undefined,
+      nativeCommit: () => undefined,
       cleanup: async () => { cleanupCalls += 1; throw new Error("simulated wrapper cleanup failure"); },
     }),
   ), /cleanup failure/);

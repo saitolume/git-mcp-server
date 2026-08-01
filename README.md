@@ -256,6 +256,19 @@ The server is not an isolation boundary for intentionally malicious hooks
 running as the same operating-system user. Hook-failure redaction is a bounded
 result contract for trusted repositories, not a sandbox for hostile hook code.
 
+Exact worktree snapshots fail closed when the index contains
+`assume-unchanged` or `skip-worktree` entries. Clear those flags before using
+status-derived mutation guards; Git may otherwise omit changed tracked paths
+from porcelain status. The bridge checks the visibility map on both sides of
+the status read and includes every tracked path in the content proof. Amend
+reconciliation captures native `HEAD` with the bridge-selected absolute Git
+executable before the repository `post-commit` hook, then requires that exact
+commit object afterward; Git's native message cleanup remains supported while
+post-commit metadata or message substitution fails closed. Push execution binds the prepared endpoint through a
+random child-only alias so ambient Git URL rewrite rules cannot retarget the
+approved operation after preflight. This does not change the caller-visible
+remote, refspec, lease, or native pre-push hook contract.
+
 When a native `pre-commit` or `commit-msg` hook rejects a commit,
 `git_commit` returns `status: "failed"` with `error.code: "HOOK_FAILED"`.
 The fixed error contains only `error.details.hook`, whose value is allowlisted

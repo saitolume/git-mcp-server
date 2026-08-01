@@ -1070,12 +1070,13 @@ async function executePreparedPushState(
   let hookAdapter: Awaited<ReturnType<typeof createPushHookAdapter>> | undefined;
   try {
     hookAdapter = await createPushHookAdapter(state.hooksPath);
+    const endpointAlias = `git-mcp-prepared://${randomUUID()}`;
     command = await runner.run({
       cwd: state.snapshot.root,
       args: [
         "push",
         `--force-with-lease=${state.branchRef}:${state.remoteHead ?? ""}`,
-        state.rawEndpoint,
+        endpointAlias,
         `${state.snapshot.head}:${state.branchRef}`,
       ],
       timeoutMs: remainingDeadlineTimeoutMs(OPERATION_TIMEOUT_MS.remote),
@@ -1084,6 +1085,7 @@ async function executePreparedPushState(
         wrappersDirectory: hookAdapter.directory,
         failureConsumer: () => undefined,
         prePushEndpoint: state.rawEndpoint,
+        preparedPushEndpointBinding: { alias: endpointAlias, endpoint: state.rawEndpoint },
       },
     }, signal);
   } catch {

@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { chmod, mkdir, mkdtemp, readFile, readlink, rm, symlink, unlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { delimiter, join } from "node:path";
 import test from "node:test";
 import type { BridgeResult, CommitAmendData } from "../src/domain/result.js";
 import { BridgeRejection } from "../src/domain/result.js";
@@ -126,7 +126,8 @@ async function fixture(t: test.TestContext): Promise<{
   await git(runner, directory, ["config", "core.hooksPath", ".hooks"]);
   await writeFile(join(directory, "owned.txt"), "base\n");
   await writeFile(join(directory, "unstaged.txt"), "base\n");
-  await git(runner, directory, ["add", "--", "owned.txt", "unstaged.txt"]);
+  await writeFile(join(directory, "clean.txt"), "clean\n");
+  await git(runner, directory, ["add", "--", "owned.txt", "unstaged.txt", "clean.txt"]);
   await git(runner, directory, ["commit", "--no-gpg-sign", "-m", "root"]);
   await writeFile(join(directory, "owned.txt"), "head\n");
   await git(runner, directory, ["add", "--", "owned.txt"]);
@@ -434,6 +435,183 @@ test("rejects a signed HEAD before running native amend hooks", async (t) => {
   assert.equal(runner.commands.some(({ args }) => args[0] === "commit"), false);
 });
 
+test("a post-commit replacement carrying signature metadata makes amend indeterminate", async (t) => {
+  const { directory, runner, sessions, snapshot, stage } = await fixture(t);
+  await hook(directory, "post-commit", [
+    'native=$(git rev-parse HEAD)',
+    'tree=$(git rev-parse "${native}^{tree}")',
+    'parents=$(git show -s --format=%P "$native")',
+    'replacement=$({',
+    '  printf "tree %s\\n" "$tree"',
+    '  for parent in $parents; do printf "parent %s\\n" "$parent"; done',
+    '  printf "author Test <test@example.test> 0 +0000\\n"',
+    '  printf "committer Test <test@example.test> 0 +0000\\n"',
+    '  printf "gpgsig fake-signature\\n continuation\\n\\nsubstituted\\n"',
+    '} | git hash-object -t commit -w --stdin)',
+    'git update-ref refs/heads/main "$replacement" "$native"',
+  ].join("\n"));
+  const worktreeSnapshotId = (await readStatus(runner, snapshot)).worktree_snapshot_id;
+  const prepared = await prepareCommitAmend(runner, sessions, snapshot, {
+    expectedBranch: "main",
+    expectedHead: snapshot.head,
+    stageId: stage.stageId,
+    worktreeSnapshotId,
+    message: "fix: signed replacement rejected\n",
+  });
+
+  let caught: unknown;
+  try { await executePreparedCommitAmend(runner, prepared); } catch (error) { caught = error; }
+
+  assert.ok(caught instanceof ProvenMutationOutcome);
+  assert.equal(caught.result.status, "indeterminate");
+  assert.equal(caught.result.error?.code, "OPERATION_INDETERMINATE");
+  assert.ok(await sessions.getStage(stage.stageId));
+});
+
+test("amend accepts and commits the message approved by commit-msg", async (t) => {
+  const { directory, runner, sessions, snapshot, stage } = await fixture(t);
+  await hook(directory, "commit-msg", 'printf "fix: hook-approved message\\n" > "$1"');
+  const worktreeSnapshotId = (await readStatus(runner, snapshot)).worktree_snapshot_id;
+  const prepared = await prepareCommitAmend(runner, sessions, snapshot, {
+    expectedBranch: "main",
+    expectedHead: snapshot.head,
+    stageId: stage.stageId,
+    worktreeSnapshotId,
+    message: "fix: requested message\n",
+  });
+
+  const execution = await executePreparedCommitAmend(runner, prepared);
+
+  assert.equal(execution.data.commit, await git(runner, directory, ["rev-parse", "HEAD"]));
+  assert.equal(await git(runner, directory, ["show", "-s", "--format=%B", "HEAD"]),
+    "fix: hook-approved message");
+});
+
+test("amend accepts Git's native cleanup of a hook-approved message", async (t) => {
+  const { directory, runner, sessions, snapshot, stage } = await fixture(t);
+  await hook(directory, "commit-msg", 'printf "fix: hook-approved message   \\n" > "$1"');
+  const worktreeSnapshotId = (await readStatus(runner, snapshot)).worktree_snapshot_id;
+  const prepared = await prepareCommitAmend(runner, sessions, snapshot, {
+    expectedBranch: "main",
+    expectedHead: snapshot.head,
+    stageId: stage.stageId,
+    worktreeSnapshotId,
+    message: "fix: requested message\n",
+  });
+
+  const execution = await executePreparedCommitAmend(runner, prepared);
+
+  assert.equal(execution.data.commit, await git(runner, directory, ["rev-parse", "HEAD"]));
+  assert.equal(await git(runner, directory, ["show", "-s", "--format=%B", "HEAD"]),
+    "fix: hook-approved message");
+});
+
+test("a PATH replacement cannot forge the native amended commit proof", async (t) => {
+  const { directory, runner, sessions, snapshot, stage } = await fixture(t);
+  const attackerBin = join(directory, "attacker-bin");
+  await mkdir(attackerBin);
+  await hook(directory, "commit-msg", [
+    'printf "fix: actually approved\\n" > "$1"',
+    `printf '#!/bin/sh\\nprintf "fix: forged proof\\n"\\n' > ${JSON.stringify(join(attackerBin, "cat"))}`,
+    `chmod 755 ${JSON.stringify(join(attackerBin, "cat"))}`,
+  ].join("\n"));
+  await hook(directory, "post-commit", [
+    'native=$(git rev-parse HEAD)',
+    'tree=$(git rev-parse "${native}^{tree}")',
+    'parents=$(git show -s --format=%P "$native")',
+    'replacement=$({',
+    '  printf "tree %s\\n" "$tree"',
+    '  for parent in $parents; do printf "parent %s\\n" "$parent"; done',
+    '  printf "author Test <test@example.test> 0 +0000\\n"',
+    '  printf "committer Test <test@example.test> 0 +0000\\n\\n"',
+    '  printf "fix: forged proof\\n"',
+    '} | git hash-object -t commit -w --stdin)',
+    'git update-ref refs/heads/main "$replacement" "$native"',
+  ].join("\n"));
+  const worktreeSnapshotId = (await readStatus(runner, snapshot)).worktree_snapshot_id;
+  const prepared = await prepareCommitAmend(runner, sessions, snapshot, {
+    expectedBranch: "main",
+    expectedHead: snapshot.head,
+    stageId: stage.stageId,
+    worktreeSnapshotId,
+    message: "fix: requested message\n",
+  });
+  const hostileRunner = new TrackingRunner(await resolveGitExecutable(), {
+    ...process.env,
+    PATH: `${attackerBin}${delimiter}${process.env.PATH ?? ""}`,
+  });
+
+  let caught: unknown;
+  try { await executePreparedCommitAmend(hostileRunner, prepared); } catch (error) { caught = error; }
+
+  assert.ok(caught instanceof ProvenMutationOutcome);
+  assert.equal(caught.result.status, "indeterminate");
+});
+
+test("a post-commit replacement with the approved message but altered metadata is indeterminate", async (t) => {
+  const { directory, runner, sessions, snapshot, stage } = await fixture(t);
+  await hook(directory, "post-commit", [
+    'native=$(git rev-parse HEAD)',
+    'tree=$(git rev-parse "${native}^{tree}")',
+    'parents=$(git show -s --format=%P "$native")',
+    'replacement=$({',
+    '  printf "tree %s\\n" "$tree"',
+    '  for parent in $parents; do printf "parent %s\\n" "$parent"; done',
+    '  printf "author Altered <altered@example.test> 0 +0000\\n"',
+    '  printf "committer Altered <altered@example.test> 0 +0000\\n\\n"',
+    '  printf "fix: approved message\\n"',
+    '} | git hash-object -t commit -w --stdin)',
+    'git update-ref refs/heads/main "$replacement" "$native"',
+  ].join("\n"));
+  const worktreeSnapshotId = (await readStatus(runner, snapshot)).worktree_snapshot_id;
+  const prepared = await prepareCommitAmend(runner, sessions, snapshot, {
+    expectedBranch: "main",
+    expectedHead: snapshot.head,
+    stageId: stage.stageId,
+    worktreeSnapshotId,
+    message: "fix: approved message\n",
+  });
+
+  let caught: unknown;
+  try { await executePreparedCommitAmend(runner, prepared); } catch (error) { caught = error; }
+
+  assert.ok(caught instanceof ProvenMutationOutcome);
+  assert.equal(caught.result.status, "indeterminate");
+});
+
+test("a post-commit replacement with an unapproved message makes amend indeterminate", async (t) => {
+  const { directory, runner, sessions, snapshot, stage } = await fixture(t);
+  await hook(directory, "post-commit", [
+    'native=$(git rev-parse HEAD)',
+    'tree=$(git rev-parse "${native}^{tree}")',
+    'parents=$(git show -s --format=%P "$native")',
+    'replacement=$({',
+    '  printf "tree %s\\n" "$tree"',
+    '  for parent in $parents; do printf "parent %s\\n" "$parent"; done',
+    '  printf "author Test <test@example.test> 0 +0000\\n"',
+    '  printf "committer Test <test@example.test> 0 +0000\\n\\n"',
+    '  printf "unapproved replacement\\n"',
+    '} | git hash-object -t commit -w --stdin)',
+    'git update-ref refs/heads/main "$replacement" "$native"',
+  ].join("\n"));
+  const worktreeSnapshotId = (await readStatus(runner, snapshot)).worktree_snapshot_id;
+  const prepared = await prepareCommitAmend(runner, sessions, snapshot, {
+    expectedBranch: "main",
+    expectedHead: snapshot.head,
+    stageId: stage.stageId,
+    worktreeSnapshotId,
+    message: "fix: approved message\n",
+  });
+
+  let caught: unknown;
+  try { await executePreparedCommitAmend(runner, prepared); } catch (error) { caught = error; }
+
+  assert.ok(caught instanceof ProvenMutationOutcome);
+  assert.equal(caught.result.status, "indeterminate");
+  assert.equal(caught.result.error?.code, "OPERATION_INDETERMINATE");
+  assert.ok(await sessions.getStage(stage.stageId));
+});
+
 test("hook rejection retains the exact stage session for retry", async (t) => {
   const { directory, runner, sessions, snapshot, stage } = await fixture(t);
   await hook(directory, "pre-commit", 'echo "private amend hook diagnostic" >&2\nexit 31');
@@ -565,6 +743,36 @@ test("post-hook unstaged mutation makes amend indeterminate", async (t) => {
   assert.equal(caught.result.error?.code, "OPERATION_INDETERMINATE");
   assert.ok(await sessions.getStage(stage.stageId));
 });
+
+for (const [name, flag] of [
+  ["assume-unchanged", "--assume-unchanged"],
+  ["skip-worktree", "--skip-worktree"],
+] as const) {
+  test(`a hook cannot hide a clean tracked-file mutation with ${name}`, async (t) => {
+    const { directory, runner, sessions, snapshot, stage } = await fixture(t);
+    await hook(directory, "pre-commit", [
+      'printf "hidden mutation\\n" > clean.txt',
+      `git update-index ${flag} -- clean.txt`,
+    ].join("\n"));
+    const worktreeSnapshotId = (await readStatus(runner, snapshot)).worktree_snapshot_id;
+    const prepared = await prepareCommitAmend(runner, sessions, snapshot, {
+      expectedBranch: "main",
+      expectedHead: snapshot.head,
+      stageId: stage.stageId,
+      worktreeSnapshotId,
+      message: `fix: reject ${name} mutation\n`,
+    });
+
+    let caught: unknown;
+    try { await executePreparedCommitAmend(runner, prepared); } catch (error) { caught = error; }
+
+    assert.ok(caught instanceof ProvenMutationOutcome);
+    assert.equal(caught.result.status, "indeterminate");
+    assert.equal(caught.result.error?.code, "OPERATION_INDETERMINATE");
+    assert.equal(await readFile(join(directory, "clean.txt"), "utf8"), "hidden mutation\n");
+    assert.ok(await sessions.getStage(stage.stageId));
+  });
+}
 
 test("post-hook unstaged mutation of an owned path makes amend indeterminate", async (t) => {
   const { directory, runner, sessions, snapshot, stage } = await fixture(t);

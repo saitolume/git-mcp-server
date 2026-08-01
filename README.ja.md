@@ -246,6 +246,19 @@ server は、同じ OS user として動く意図的に悪意のある hooks に
 boundary ではありません。hook failure redaction は trusted repositories のための
 bounded result contract であり、敵対的な hook code の sandbox ではありません。
 
+index に `assume-unchanged` または `skip-worktree` entry がある場合、exact worktree
+snapshot は fail closed します。Git が変更済み tracked path を porcelain status から
+省略する可能性があるため、status-derived mutation guard を使う前にこれらの flag を
+解除してください。bridge は status read の前後で visibility map を検査し、全 tracked
+path を content proof に含めます。amend reconciliation は repository の `post-commit`
+hook より前に bridge が選んだ absolute Git executable で native `HEAD` を capture し、
+終了後もその exact commit object であることを要求します。これにより Git native の
+message cleanup は許容しつつ、post-commit による metadata/message 置換は fail closed
+します。push execution は prepared endpoint を random な child-only alias
+へ bind し、preflight 後に ambient Git URL rewrite rule が承認済み operation を別の
+destination へ向けることを防ぎます。caller-visible remote、refspec、lease、native
+pre-push hook contract は変わりません。
+
 native `pre-commit` または `commit-msg` hook が commit を拒否した場合、
 `git_commit` は `status: "failed"` と `error.code: "HOOK_FAILED"` を返します。
 固定 error が含む hook 情報は `error.details.hook` のみで、値は `pre-commit` または

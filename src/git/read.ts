@@ -9,7 +9,7 @@ import { BridgeRejection } from "../domain/result.js";
 import type { DiffData, StatusData, StatusEntry } from "../domain/result.js";
 import { RETURNED_PATH_SET_MAX_BYTES, RETURNED_PATH_SET_MAX_COUNT } from "../limits.js";
 import type { RepositorySnapshot } from "./repository.js";
-import { readIndexStageMap } from "./repository.js";
+import { assertNoHiddenIndexEntries, readIndexStageMap } from "./repository.js";
 import { assertTrackedPathConfined, validatePaths } from "./path-policy.js";
 import { literalPathChunks } from "./pathspec.js";
 import { GitRunner, type GitCommandResult } from "./runner.js";
@@ -159,6 +159,7 @@ async function readStatusEntries(
   snapshot: RepositorySnapshot,
   signal?: AbortSignal,
 ): Promise<readonly ParsedStatusEntry[]> {
+  const visibilityBefore = await assertNoHiddenIndexEntries(runner, snapshot.root, signal);
   const headers = new Map<string, string>();
   const entries: ParsedStatusEntry[] = [];
   let resultBytes = 0;
@@ -210,6 +211,13 @@ async function readStatusEntries(
   if (headers.get("branch.oid") !== snapshot.head || headers.get("branch.head") !== expectedBranch) {
     throw new Error("incoherent Git status branch headers");
   }
+  const visibilityAfter = await assertNoHiddenIndexEntries(runner, snapshot.root, signal);
+  if (visibilityAfter !== visibilityBefore) {
+    throw new BridgeRejection({
+      code: "UNSUPPORTED_REPOSITORY_STATE",
+      message: "Index visibility state changed while reading status",
+    });
+  }
   return entries.sort((left, right) => compareText(left.path, right.path)
     || compareText(left.kind, right.kind) || compareText(left.index, right.index) || compareText(left.worktree, right.worktree));
 }
@@ -220,7 +228,7 @@ async function trackedIndexEntries(
   paths: ReadonlySet<string>,
   signal?: AbortSignal,
 ): Promise<ReadonlyMap<string, readonly TrackedIndexEntry[]>> {
-  const proof = await readIndexStageMap(runner, snapshot.root, signal, paths, true);
+  const proof = await readIndexStageMap(runner, snapshot.root, signal, paths, true, true);
   const entries = new Map<string, readonly TrackedIndexEntry[]>();
   for (const [path, stageEntries] of proof.capturedEntries) {
     await assertTrackedPathConfined(snapshot.root, path);

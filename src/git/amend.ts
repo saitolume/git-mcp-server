@@ -1,4 +1,5 @@
 import { remainingDeadlineTimeoutMs, withReconciliationDeadline } from "../deadline.js";
+import { isWellFormedGitText } from "../domain/git-text.js";
 import type { BridgeResult, CommitAmendData } from "../domain/result.js";
 import {
   BridgeRejection,
@@ -73,6 +74,7 @@ interface CommitObjectProof {
   readonly tree: string;
   readonly parents: readonly string[];
   readonly signed: boolean;
+  readonly message: string;
 }
 
 interface PreparedState {
@@ -120,6 +122,10 @@ async function readCommitObject(
   if (!completeRead(result)) throw new Error("Unable to prove current commit metadata");
   const separator = result.stdout.indexOf("\n\n");
   if (separator < 0) throw new Error("Git returned malformed commit metadata");
+  const message = result.stdout.slice(separator + 2);
+  if (!isWellFormedGitText(message) || message.includes("\0")) {
+    throw new Error("Git returned malformed commit metadata");
+  }
   const parents: string[] = [];
   let tree: string | undefined;
   let signed = false;
@@ -147,7 +153,7 @@ async function readCommitObject(
     if (name === "gpgsig" || name === "gpgsig-sha256") signed = true;
   }
   if (tree === undefined || new Set(parents).size !== parents.length) throw new Error("Git returned malformed commit metadata");
-  return Object.freeze({ tree, parents: Object.freeze(parents), signed });
+  return Object.freeze({ tree, parents: Object.freeze(parents), signed, message });
 }
 
 function sameParents(left: readonly string[], right: readonly string[]): boolean {
@@ -313,19 +319,27 @@ export async function executePreparedCommitAmend(
   }
   let command: GitCommandResult | undefined;
   let wrappers: Awaited<ReturnType<typeof createHookWrappers>> | undefined;
+  let nativeCommit: string | undefined;
   try {
-    wrappers = await createHookWrappers(state.hooksPath);
+    wrappers = await createHookWrappers(state.hooksPath, { captureNativeCommitWith: runner.gitExecutablePath() });
     command = await runner.run({
       cwd: state.snapshot.root,
       args: ["commit", "--amend", "--no-gpg-sign", "--file=-"],
       stdin: state.message,
       timeoutMs: remainingDeadlineTimeoutMs(OPERATION_TIMEOUT_MS.commit),
       maxOutputBytes: MUTATION_OUTPUT_LIMIT,
-      hookExecution: { wrappersDirectory: wrappers.directory, failureConsumer: wrappers.failureConsumer },
+      hookExecution: {
+        wrappersDirectory: wrappers.directory,
+        failureConsumer: wrappers.failureConsumer,
+        ...(wrappers.nativeCommitConsumer === undefined ? {} : {
+          nativeCommitConsumer: wrappers.nativeCommitConsumer,
+        }),
+      },
     }, signal);
   } catch {
     command = undefined;
   } finally {
+    nativeCommit = wrappers?.nativeCommit();
     try { await wrappers?.cleanup(); } catch { /* Private wrapper cleanup cannot alter Git outcome. */ }
   }
 
@@ -361,7 +375,9 @@ export async function executePreparedCommitAmend(
     let changedPaths: readonly string[];
     try {
       amended = await readCommitObject(runner, after.root, after.head);
-      if (amended.tree !== after.headTree || !sameParents(state.oldCommit.parents, amended.parents)) indeterminate();
+      if (nativeCommit === undefined || after.head !== nativeCommit
+        || amended.signed || amended.tree !== after.headTree
+        || !sameParents(state.oldCommit.parents, amended.parents)) indeterminate();
       const amendedTree = await readCommitTreeProof(runner, after.root, after.head, new Set());
       if (amendedTree.fingerprint !== state.preIndexTreeFingerprint || after.indexTree !== state.snapshot.indexTree) {
         indeterminate();

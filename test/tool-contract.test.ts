@@ -328,6 +328,17 @@ test("guarded history result schemas expose only the published payloads", () => 
     old_commit: "a".repeat(40), commit: "b".repeat(40), old_tree: "c".repeat(40), tree: "d".repeat(40),
     hook_changed_paths: ["src/index.ts"], signing: "disabled_by_policy",
   }).success, true);
+  for (const [oldCommitWidth, commitWidth, oldTreeWidth, treeWidth] of [
+    [40, 40, 40, 64], [40, 40, 64, 40], [40, 64, 40, 40], [64, 40, 40, 40],
+    [64, 64, 64, 40], [64, 64, 40, 64], [64, 40, 64, 64], [40, 64, 64, 64],
+  ] as const) {
+    assert.equal(commitAmendDataSchema.safeParse({
+      old_commit: "a".repeat(oldCommitWidth), commit: "b".repeat(commitWidth),
+      old_tree: "c".repeat(oldTreeWidth), tree: "d".repeat(treeWidth),
+      hook_changed_paths: [], signing: "disabled_by_policy",
+    }).success, false,
+    `mixed amend output ${oldCommitWidth}/${commitWidth}/${oldTreeWidth}/${treeWidth}`);
+  }
   assert.equal(rewordDataSchema.safeParse({
     base: "a".repeat(40), old_head: "b".repeat(40), head: "c".repeat(40), commit_count: 1,
     destination: { mode: "current_branch", branch: "feature/history" },

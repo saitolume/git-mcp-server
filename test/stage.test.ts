@@ -337,7 +337,8 @@ test("switch create creates only a new branch from the exact clean HEAD", async 
   assert.ok(runner.commands.some(({ args }) => JSON.stringify(args) === JSON.stringify(["check-ref-format", "--branch", "topic/task-8"])));
   const switchIndex = runner.commands.findIndex(({ args }) => JSON.stringify(args) === JSON.stringify(["switch", "-c", "topic/task-8"]));
   assert.ok(switchIndex > 0);
-  assert.deepEqual(runner.commands[switchIndex - 2]?.args, ["status", "--porcelain=v2", "--branch", "-z", "--untracked-files=all"]);
+  assert.deepEqual(runner.commands[switchIndex - 3]?.args, ["status", "--porcelain=v2", "--branch", "-z", "--untracked-files=all"]);
+  assert.deepEqual(runner.commands[switchIndex - 2]?.args, ["ls-files", "--cached", "-v", "-z"]);
   assert.deepEqual(runner.commands[switchIndex - 1]?.args, ["ls-files", "--stage", "-z"]);
 });
 

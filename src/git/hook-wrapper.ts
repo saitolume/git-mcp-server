@@ -1,7 +1,8 @@
 import { chmod, mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { isAbsolute, join } from "node:path";
 import type { CommitHookKind } from "../domain/result.js";
+import { isWellFormedGitText } from "../domain/git-text.js";
 
 const CLASSIFIED_HOOKS = new Set<CommitHookKind>(["pre-commit", "commit-msg"]);
 const KNOWN_GIT_HOOKS = [
@@ -15,11 +16,14 @@ const KNOWN_GIT_HOOKS = [
   "post-index-change",
 ] as const;
 const FAILURE_CHANNEL_MAX_BYTES = 32;
+const NATIVE_COMMIT_MAX_BYTES = 66;
 
 export interface HookWrapperSet {
   readonly directory: string;
   readonly failureConsumer: (chunk: Buffer) => void;
+  readonly nativeCommitConsumer?: (chunk: Buffer) => void;
   rejectedHook(): CommitHookKind | undefined;
+  nativeCommit(): string | undefined;
   cleanup(): Promise<void>;
 }
 
@@ -48,16 +52,22 @@ function shellQuote(value: string): string {
   return `'${value.replaceAll("'", `'\\''`)}'`;
 }
 
-function wrapperScript(original: string, hook: string): string {
+function wrapperScript(original: string, hook: string, nativeCommitGitExecutable?: string): string {
   const report = CLASSIFIED_HOOKS.has(hook as CommitHookKind)
     ? `if [ "$status" -ne 0 ]; then printf '%s\\n' ${shellQuote(hook)} >&3 || :; fi\n`
     : "";
+  const capture = nativeCommitGitExecutable !== undefined && hook === "post-commit"
+    ? [
+      `if [ "$status" -eq 0 ]; then ${shellQuote(nativeCommitGitExecutable)} --no-replace-objects rev-parse --verify HEAD >&4 || status=$?; fi`,
+      'if [ "$status" -eq 0 ]; then printf \'\\0\' >&4 || status=$?; fi',
+    ]
+    : [];
   return [
     "#!/bin/sh",
-    "unset GIT_CONFIG_COUNT GIT_CONFIG_KEY_0 GIT_CONFIG_VALUE_0 GIT_MCP_PREPARED_PUSH_ENDPOINT",
-    `if [ ! -x ${shellQuote(original)} ]; then exit 0; fi`,
+    "unset GIT_CONFIG_COUNT GIT_CONFIG_KEY_0 GIT_CONFIG_VALUE_0 GIT_CONFIG_KEY_1 GIT_CONFIG_VALUE_1 GIT_MCP_PREPARED_PUSH_ENDPOINT",
     "status=0",
-    `${shellQuote(original)} "$@" 3>&- || status=$?`,
+    ...capture,
+    `if [ "$status" -eq 0 ] && [ -x ${shellQuote(original)} ]; then ${shellQuote(original)} "$@" 3>&- 4>&- || status=$?; fi`,
     report.trimEnd(),
     'exit "$status"',
     "",
@@ -69,7 +79,7 @@ function pushAdapterScript(original: string): string {
     "#!/bin/sh",
     'if [ "${GIT_MCP_PREPARED_PUSH_ENDPOINT+x}" != "x" ]; then exit 1; fi',
     "endpoint=$GIT_MCP_PREPARED_PUSH_ENDPOINT",
-    "unset GIT_CONFIG_COUNT GIT_CONFIG_KEY_0 GIT_CONFIG_VALUE_0 GIT_MCP_PREPARED_PUSH_ENDPOINT",
+    "unset GIT_CONFIG_COUNT GIT_CONFIG_KEY_0 GIT_CONFIG_VALUE_0 GIT_CONFIG_KEY_1 GIT_CONFIG_VALUE_1 GIT_MCP_PREPARED_PUSH_ENDPOINT",
     `if [ ! -x ${shellQuote(original)} ]; then exit 0; fi`,
     `exec ${shellQuote(original)} origin "$endpoint" 3>&-`,
     "",
@@ -101,10 +111,46 @@ class FailureChannel {
   }
 }
 
-export async function createHookWrappers(originalHooksDirectory: string): Promise<HookWrapperSet> {
+class NativeCommitChannel {
+  private readonly chunks: Buffer[] = [];
+  private bytes = 0;
+  private usable = true;
+
+  consume(chunk: Buffer): void {
+    if (!this.usable) return;
+    this.bytes += chunk.length;
+    if (this.bytes > NATIVE_COMMIT_MAX_BYTES) {
+      this.usable = false;
+      this.chunks.length = 0;
+      return;
+    }
+    this.chunks.push(Buffer.from(chunk));
+  }
+
+  value(): string | undefined {
+    if (!this.usable || this.bytes === 0) return undefined;
+    const framed = Buffer.concat(this.chunks, this.bytes);
+    const terminator = framed.indexOf(0);
+    if (terminator !== framed.length - 1) return undefined;
+    const bytes = framed.subarray(0, terminator);
+    const value = bytes.toString("ascii");
+    const match = /^([0-9a-f]{40}|[0-9a-f]{64})\n$/.exec(value);
+    return match?.[1];
+  }
+}
+
+export async function createHookWrappers(
+  originalHooksDirectory: string,
+  options: { readonly captureNativeCommitWith?: string } = {},
+): Promise<HookWrapperSet> {
   const directory = await mkdtemp(join(tmpdir(), "git-mcp-server-hooks-"));
   await chmod(directory, 0o700);
   const channel = new FailureChannel();
+  if (options.captureNativeCommitWith !== undefined
+    && (!isAbsolute(options.captureNativeCommitWith) || !isWellFormedGitText(options.captureNativeCommitWith))) {
+    throw new Error("Native commit capture requires an absolute Git executable path");
+  }
+  const nativeCommit = options.captureNativeCommitWith === undefined ? undefined : new NativeCommitChannel();
   try {
     let entries: string[];
     try {
@@ -118,7 +164,7 @@ export async function createHookWrappers(originalHooksDirectory: string): Promis
     await Promise.all([...names].map(async (name) => {
       const original = join(originalHooksDirectory, name);
       const wrapper = join(directory, name);
-      await writeFile(wrapper, wrapperScript(original, name), { encoding: "utf8", mode: 0o700 });
+      await writeFile(wrapper, wrapperScript(original, name, options.captureNativeCommitWith), { encoding: "utf8", mode: 0o700 });
     }));
   } catch (error) {
     await rm(directory, { recursive: true, force: true });
@@ -127,7 +173,11 @@ export async function createHookWrappers(originalHooksDirectory: string): Promis
   return {
     directory,
     failureConsumer: (chunk) => channel.consume(chunk),
+    ...(nativeCommit === undefined ? {} : {
+      nativeCommitConsumer: (chunk: Buffer) => nativeCommit.consume(chunk),
+    }),
     rejectedHook: () => channel.rejectedHook(),
+    nativeCommit: () => nativeCommit?.value(),
     cleanup: async () => rm(directory, { recursive: true, force: true }),
   };
 }

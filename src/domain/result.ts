@@ -258,7 +258,13 @@ export const commitAmendDataSchema = z.strictObject({
   tree: objectId,
   hook_changed_paths: returnedGitOutputPaths,
   signing: z.literal("disabled_by_policy"),
-});
+}).refine(
+  ({ old_commit, commit, old_tree, tree }) =>
+    old_commit.length === commit.length
+      && commit.length === old_tree.length
+      && old_tree.length === tree.length,
+  "old_commit, commit, old_tree, and tree must use one object ID width",
+);
 
 const operationDataSchemas: Readonly<Record<string, z.ZodType>> = {
   git_status: statusDataSchema,
