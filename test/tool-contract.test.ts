@@ -2,14 +2,18 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { z } from "zod";
 import {
-  absoluteRepositoryPath, gitAddInput, gitOutputPath, gitPushInput, gitRestoreWorktreeInput,
-  gitSwitchCreateInput, originRemoteRef, relativeGitPath,
+  absoluteRepositoryPath, gitAddInput, gitCommitAmendInput, gitCommitRangeValidateInput,
+  gitOutputPath, gitPushForceWithLeaseInput, gitPushInput, gitRestoreWorktreeInput,
+  gitRewordInput, gitSwitchCreateInput, localBranchName, originRemoteRef, relativeGitPath,
 } from "../src/domain/inputs.js";
 import { redactDiagnostic } from "../src/domain/redaction.js";
 import {
   BRIDGE_ERROR_CODES,
   bridgeResultSchema,
+  commitAmendDataSchema,
   commitDataSchema,
+  commitRangeValidateDataSchema,
+  rewordDataSchema,
   statusDataSchema,
   switchCreateDataSchema,
 } from "../src/domain/result.js";
@@ -19,6 +23,8 @@ const EXPECTED_TOOL_NAMES = [
   "git_status", "git_diff", "git_switch_create", "git_switch_attach", "git_add",
   "git_restore_staged", "git_restore_worktree", "git_commit", "git_fetch",
   "git_merge", "git_merge_continue", "git_merge_abort", "git_push",
+  "git_push_force_with_lease",
+  "git_commit_range_validate", "git_reword", "git_commit_amend",
   "git_operation_get",
 ] as const;
 type ExpectedToolName = (typeof EXPECTED_TOOL_NAMES)[number];
@@ -29,7 +35,7 @@ const expectedCatalog = TOOL_CATALOG as unknown as Record<ExpectedToolName, {
   outputSchema: { safeParse: unknown };
 }>;
 
-test("the catalog contains the approved 14 Git tools", () => {
+test("the catalog contains the approved 18 Git tools", () => {
   assert.deepEqual(TOOL_NAMES, EXPECTED_TOOL_NAMES);
 });
 
@@ -46,7 +52,7 @@ test("every tool declares complete annotations", () => {
 });
 
 const DESCRIPTION_FRAGMENTS: Readonly<Record<ExpectedToolName, readonly string[]>> = {
-  git_status: ["repository_id", "worktree_snapshot_id", "read-only"],
+  git_status: ["repository_id", "worktree_snapshot_id", "non-ignored", "read-only"],
   git_diff: ["max_bytes", "1000000", "omitted paths", "read-only"],
   git_switch_create: ["exact expected HEAD", "expected_branch", "null", "detached HEAD", "existing branch", "force"],
   git_switch_attach: ["existing local branch", "expected_branch_head", "detached HEAD", "same", "other worktree", "remote", "--no-guess"],
@@ -59,6 +65,10 @@ const DESCRIPTION_FRAGMENTS: Readonly<Record<ExpectedToolName, readonly string[]
   git_merge_continue: ["merge_session_id", "commit", "external"],
   git_merge_abort: ["merge_session_id", "head", "external"],
   git_push: ["local_head", "remote_head", "non-fast-forward", "delete"],
+  git_push_force_with_lease: ["local_head", "remote_head", "non-fast-forward", "exact lease", "tags", "deletion", "active sessions"],
+  git_commit_range_validate: ["linear", "commit-msg", "base", "reword", "hook bypass"],
+  git_reword: ["pairwise tree", "commit-msg", "exact CAS", "new_branch", "force push"],
+  git_commit_amend: ["old and new commit/tree IDs", "parent set", "worktree", "signed HEAD", "hook bypass"],
   git_operation_get: ["request_id", "stored terminal result", "Git", "retry"],
 };
 
@@ -121,6 +131,7 @@ function hasGeneratedConstraint(schema: JsonSchemaNode): boolean {
     || schema.format !== undefined || schema.minLength !== undefined || schema.maxLength !== undefined
     || schema.minimum !== undefined || schema.maximum !== undefined || schema.minItems !== undefined
     || (schema.items !== undefined && hasGeneratedConstraint(schema.items))
+    || Object.values(schema.properties ?? {}).some(hasGeneratedConstraint)
     || (schema.anyOf?.some(hasGeneratedConstraint) ?? false)
     || (schema.oneOf?.some(hasGeneratedConstraint) ?? false)
     || (schema.allOf?.some(hasGeneratedConstraint) ?? false);
@@ -212,6 +223,126 @@ test("mutation schemas reject unknown fields and unsafe paths", () => {
     repository: "/repo", request_id: "018f47d2-7b2a-7d75-b9dd-5ea8abca0005",
     expected_branch: "main", expected_head: "a".repeat(40), paths: ["src/index.ts"],
     stage_id: "stage", merge_session_id: "merge",
+  }).success, false);
+});
+
+test("guarded history inputs accept only their published wire contracts", () => {
+  const base = {
+    repository: "/repo",
+    request_id: "018f47d2-7b2a-7d75-b9dd-5ea8abca0100",
+    expected_branch: "feature/history",
+    expected_head: "b".repeat(40),
+  };
+  assert.equal(gitCommitRangeValidateInput.safeParse({
+    ...base,
+    base: "a".repeat(40),
+  }).success, true);
+  for (const width of [39, 40, 41, 63, 64, 65]) {
+    assert.equal(gitCommitRangeValidateInput.safeParse({
+      ...base, expected_head: "b".repeat(width), base: "a".repeat(width),
+    }).success, width === 40 || width === 64, `range input width ${width}`);
+  }
+  for (const [baseWidth, headWidth] of [[40, 64], [64, 40]] as const) {
+    assert.equal(gitCommitRangeValidateInput.safeParse({
+      ...base, expected_head: "b".repeat(headWidth), base: "a".repeat(baseWidth),
+    }).success, false, `mixed range input ${baseWidth}/${headWidth}`);
+  }
+  assert.equal(gitRewordInput.safeParse({
+    ...base,
+    base: "a".repeat(40),
+    commits: [{ commit: "b".repeat(40), message: "feat(scope): valid" }],
+    destination: { mode: "current_branch" },
+  }).success, true);
+  for (const [headWidth, baseWidth, commitWidth] of [
+    [40, 40, 64], [40, 64, 40], [64, 40, 64], [64, 64, 40],
+  ] as const) {
+    assert.equal(gitRewordInput.safeParse({
+      ...base, expected_head: "b".repeat(headWidth), base: "a".repeat(baseWidth),
+      commits: [{ commit: "c".repeat(commitWidth), message: "feat(scope): valid" }],
+      destination: { mode: "current_branch" },
+    }).success, false, `mixed reword input ${headWidth}/${baseWidth}/${commitWidth}`);
+  }
+  assert.equal(gitRewordInput.safeParse({
+    ...base,
+    base: "a".repeat(40),
+    commits: [],
+    destination: { mode: "new_branch", branch: "refs/heads/raw" },
+  }).success, false);
+  assert.equal(gitCommitAmendInput.safeParse({
+    ...base,
+    stage_id: "stage-1",
+    worktree_snapshot_id: "c".repeat(64),
+    message: "fix: amend safely",
+  }).success, true);
+  assert.equal(gitPushForceWithLeaseInput.safeParse({
+    ...base,
+    expected_remote_head: null,
+  }).success, true);
+  for (const branch of ["HEAD", "refs/heads/raw", "topic..bad", "topic/.lock", "topic/�"]) {
+    assert.equal(localBranchName.safeParse(branch).success, false, branch);
+  }
+  assert.equal(gitRewordInput.safeParse({
+    ...base,
+    base: "a".repeat(40),
+    commits: [{ commit: "b".repeat(40), message: "feat: valid", extra: true }],
+    destination: { mode: "current_branch" },
+  }).success, false);
+});
+
+test("guarded history result schemas expose only the published payloads", () => {
+  assert.equal(commitRangeValidateDataSchema.safeParse({
+    base: "a".repeat(40), head: "b".repeat(40), commit_count: 1, hook: "commit-msg",
+  }).success, true);
+  assert.equal(commitRangeValidateDataSchema.safeParse({
+    base: "a".repeat(40), head: "b".repeat(40), commit_count: 128, hook: "commit-msg",
+  }).success, true);
+  assert.equal(commitRangeValidateDataSchema.safeParse({
+    base: "a".repeat(40), head: "b".repeat(40), commit_count: 129, hook: "commit-msg",
+  }).success, false);
+  for (const width of [39, 40, 41, 63, 64, 65]) {
+    assert.equal(commitRangeValidateDataSchema.safeParse({
+      base: "a".repeat(width), head: "b".repeat(width), commit_count: 1, hook: "commit-msg",
+    }).success, width === 40 || width === 64, `range output width ${width}`);
+  }
+  for (const [baseWidth, headWidth] of [[40, 64], [64, 40]] as const) {
+    assert.equal(commitRangeValidateDataSchema.safeParse({
+      base: "a".repeat(baseWidth), head: "b".repeat(headWidth), commit_count: 1, hook: "commit-msg",
+    }).success, false, `mixed range output ${baseWidth}/${headWidth}`);
+  }
+  assert.equal(rewordDataSchema.safeParse({
+    base: "a".repeat(40), old_head: "b".repeat(40), head: "c".repeat(40), commit_count: 1,
+    destination: { mode: "new_branch", branch: "reworded/history", source_branch: "feature/history" },
+    trees_unchanged: true, hook: "commit-msg", signing: "disabled_by_policy",
+  }).success, true);
+  for (const [baseWidth, oldHeadWidth, headWidth] of [
+    [40, 40, 64], [40, 64, 40], [40, 64, 64],
+    [64, 40, 40], [64, 40, 64], [64, 64, 40],
+  ] as const) {
+    assert.equal(rewordDataSchema.safeParse({
+      base: "a".repeat(baseWidth), old_head: "b".repeat(oldHeadWidth), head: "c".repeat(headWidth), commit_count: 1,
+      destination: { mode: "current_branch", branch: "feature/history" },
+      trees_unchanged: true, hook: "commit-msg", signing: "disabled_by_policy",
+    }).success, false, `mixed reword output ${baseWidth}/${oldHeadWidth}/${headWidth}`);
+  }
+  assert.equal(commitAmendDataSchema.safeParse({
+    old_commit: "a".repeat(40), commit: "b".repeat(40), old_tree: "c".repeat(40), tree: "d".repeat(40),
+    hook_changed_paths: ["src/index.ts"], signing: "disabled_by_policy",
+  }).success, true);
+  for (const [oldCommitWidth, commitWidth, oldTreeWidth, treeWidth] of [
+    [40, 40, 40, 64], [40, 40, 64, 40], [40, 64, 40, 40], [64, 40, 40, 40],
+    [64, 64, 64, 40], [64, 64, 40, 64], [64, 40, 64, 64], [40, 64, 64, 64],
+  ] as const) {
+    assert.equal(commitAmendDataSchema.safeParse({
+      old_commit: "a".repeat(oldCommitWidth), commit: "b".repeat(commitWidth),
+      old_tree: "c".repeat(oldTreeWidth), tree: "d".repeat(treeWidth),
+      hook_changed_paths: [], signing: "disabled_by_policy",
+    }).success, false,
+    `mixed amend output ${oldCommitWidth}/${commitWidth}/${oldTreeWidth}/${treeWidth}`);
+  }
+  assert.equal(rewordDataSchema.safeParse({
+    base: "a".repeat(40), old_head: "b".repeat(40), head: "c".repeat(40), commit_count: 1,
+    destination: { mode: "current_branch", branch: "feature/history" },
+    trees_unchanged: true, hook: "commit-msg", signing: "disabled_by_policy", message: "must not leak",
   }).success, false);
 });
 

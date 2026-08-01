@@ -17,6 +17,9 @@ const EXPECTED_TOOLS = [
   "git_status", "git_diff", "git_switch_create", "git_switch_attach", "git_add",
   "git_restore_staged", "git_restore_worktree", "git_commit", "git_fetch",
   "git_merge", "git_merge_continue", "git_merge_abort", "git_push",
+  "git_push_force_with_lease",
+  "git_commit_range_validate",
+  "git_reword", "git_commit_amend",
   "git_operation_get",
 ] as const;
 
@@ -34,6 +37,7 @@ const MUTATION = {
 } as const;
 const DESTRUCTIVE = { ...MUTATION, destructiveHint: true } as const;
 const OPEN_WORLD = { ...MUTATION, openWorldHint: true } as const;
+const DESTRUCTIVE_OPEN_WORLD = { ...DESTRUCTIVE, openWorldHint: true } as const;
 interface ToolAnnotations {
   readonly readOnlyHint: boolean;
   readonly destructiveHint: boolean;
@@ -54,6 +58,10 @@ const EXPECTED_ANNOTATIONS: Record<(typeof EXPECTED_TOOLS)[number], ToolAnnotati
   git_merge_continue: DESTRUCTIVE,
   git_merge_abort: DESTRUCTIVE,
   git_push: OPEN_WORLD,
+  git_push_force_with_lease: DESTRUCTIVE_OPEN_WORLD,
+  git_commit_range_validate: MUTATION,
+  git_reword: DESTRUCTIVE,
+  git_commit_amend: DESTRUCTIVE,
   git_operation_get: READ_ONLY,
 };
 
@@ -67,7 +75,7 @@ function git(args: readonly string[], cwd: string): string {
   return result.stdout.trim();
 }
 
-test("opt-in package install uses an isolated pnpm store and installed CLI", async (t) => {
+test("opt-in package install discovers every guarded-recovery tool without forcing the fixture repository", async (t) => {
   const workspace = await createPackageWorkspace();
   t.after(async () => removePackageWorkspace(workspace));
   const manifest = JSON.parse(await readFile(join(repositoryRoot, "package.json"), "utf8")) as { version: string };

@@ -9,7 +9,7 @@ import { BridgeRejection } from "../domain/result.js";
 import type { DiffData, StatusData, StatusEntry } from "../domain/result.js";
 import { RETURNED_PATH_SET_MAX_BYTES, RETURNED_PATH_SET_MAX_COUNT } from "../limits.js";
 import type { RepositorySnapshot } from "./repository.js";
-import { readIndexStageMap } from "./repository.js";
+import { assertNoHiddenIndexEntries, readIndexStageMap } from "./repository.js";
 import { assertTrackedPathConfined, validatePaths } from "./path-policy.js";
 import { literalPathChunks } from "./pathspec.js";
 import { GitRunner, type GitCommandResult } from "./runner.js";
@@ -127,7 +127,17 @@ function parseStatusRecord(record: string): ParsedStatusEntry {
       || !OBJECT_ID.test(head3)) malformedStatus("unmerged record");
     return { path: statusPath(path, "unmerged"), index: xy[0]!, worktree: xy[1]!, submodule, kind: "unmerged" };
   }
-  if (record.startsWith("? ")) return { path: statusPath(record.slice(2), "untracked"), index: "?", worktree: "?", submodule: "N...", kind: "untracked" };
+  if (record.startsWith("? ")) {
+    const path = record.slice(2);
+    if (path.endsWith("/")) {
+      throw new BridgeRejection({
+        code: "UNSUPPORTED_REPOSITORY_STATE",
+        message: "Git-visible untracked directory records cannot be content-proven",
+        details: { path },
+      });
+    }
+    return { path: statusPath(path, "untracked"), index: "?", worktree: "?", submodule: "N...", kind: "untracked" };
+  }
   malformedStatus("unknown record");
 }
 
@@ -149,6 +159,7 @@ async function readStatusEntries(
   snapshot: RepositorySnapshot,
   signal?: AbortSignal,
 ): Promise<readonly ParsedStatusEntry[]> {
+  const visibilityBefore = await assertNoHiddenIndexEntries(runner, snapshot.root, signal);
   const headers = new Map<string, string>();
   const entries: ParsedStatusEntry[] = [];
   let resultBytes = 0;
@@ -200,6 +211,13 @@ async function readStatusEntries(
   if (headers.get("branch.oid") !== snapshot.head || headers.get("branch.head") !== expectedBranch) {
     throw new Error("incoherent Git status branch headers");
   }
+  const visibilityAfter = await assertNoHiddenIndexEntries(runner, snapshot.root, signal);
+  if (visibilityAfter !== visibilityBefore) {
+    throw new BridgeRejection({
+      code: "UNSUPPORTED_REPOSITORY_STATE",
+      message: "Index visibility state changed while reading status",
+    });
+  }
   return entries.sort((left, right) => compareText(left.path, right.path)
     || compareText(left.kind, right.kind) || compareText(left.index, right.index) || compareText(left.worktree, right.worktree));
 }
@@ -210,7 +228,7 @@ async function trackedIndexEntries(
   paths: ReadonlySet<string>,
   signal?: AbortSignal,
 ): Promise<ReadonlyMap<string, readonly TrackedIndexEntry[]>> {
-  const proof = await readIndexStageMap(runner, snapshot.root, signal, paths, true);
+  const proof = await readIndexStageMap(runner, snapshot.root, signal, paths, true, true);
   const entries = new Map<string, readonly TrackedIndexEntry[]>();
   for (const [path, stageEntries] of proof.capturedEntries) {
     await assertTrackedPathConfined(snapshot.root, path);
@@ -229,6 +247,10 @@ function sameRegularFileState(left: BigIntStats, right: BigIntStats): boolean {
 
 function changedWhileHashing(): Error {
   return new Error("Tracked regular file changed while hashing");
+}
+
+function trackedSymlinkChangedWhileReading(): Error {
+  return new Error("Tracked symlink changed while reading its target");
 }
 
 export async function hashRegularFileForSnapshot(
@@ -353,6 +375,13 @@ async function fingerprintTrackedPath(
     const stats = await lstat(fullPath, { bigint: true });
     const mode = Number(stats.mode);
     const isGitlink = indexEntries.some((entry) => entry.mode === "160000");
+    if (!stats.isDirectory() && !stats.isFile() && !stats.isSymbolicLink()) {
+      throw new BridgeRejection({
+        code: "UNSUPPORTED_REPOSITORY_STATE",
+        message: "Tracked special filesystem entries cannot be safely content-proven",
+        details: { path },
+      });
+    }
     if (isGitlink && !includeNestedGitHead) {
       const outerType = stats.isDirectory() ? "directory"
         : stats.isFile() ? "file"
@@ -363,13 +392,28 @@ async function fingerprintTrackedPath(
     }
     if (stats.isSymbolicLink()) {
       await assertTrackedPathConfined(root, path);
-      return { path, index, kind: "symlink", mode, target: await readlink(fullPath) };
+      let target: Buffer;
+      try { target = await readlink(fullPath, { encoding: "buffer" }); }
+      catch { throw trackedSymlinkChangedWhileReading(); }
+      hashBudget.reserve(BigInt(target.byteLength));
+      let after: BigIntStats;
+      try { after = await lstat(fullPath, { bigint: true }); }
+      catch { throw trackedSymlinkChangedWhileReading(); }
+      throwIfDeadlineExceeded(signal);
+      if (!after.isSymbolicLink() || !samePathState(stats, after)) throw trackedSymlinkChangedWhileReading();
+      return { path, index, kind: "symlink", mode, target: target.toString("base64") };
     }
     if (isGitlink) {
       await assertTrackedPathConfined(root, path);
       return { path, index, kind: "gitlink", mode, ...await gitlinkIdentity(runner, root, fullPath, signal) };
     }
-    if (stats.isDirectory()) return { path, index, kind: "directory", mode };
+    if (stats.isDirectory()) {
+      throw new BridgeRejection({
+        code: "UNSUPPORTED_REPOSITORY_STATE",
+        message: "Tracked directory entries must be initialized gitlinks",
+        details: { path },
+      });
+    }
     if (stats.isFile()) {
       await assertTrackedPathConfined(root, path);
       return {
@@ -377,7 +421,11 @@ async function fingerprintTrackedPath(
         content: await hashRegularFileForSnapshot(fullPath, stats, hashBudget, signal),
       };
     }
-    return { path, index, kind: "other", mode };
+    throw new BridgeRejection({
+      code: "UNSUPPORTED_REPOSITORY_STATE",
+      message: "Tracked path type cannot be safely content-proven",
+      details: { path },
+    });
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return { path, index, kind: "missing" };
     throw error;
@@ -444,13 +492,19 @@ async function fingerprintUntrackedPath(
   path: string,
   budget: WorktreeHashBudget,
   signal?: AbortSignal,
+  allowMissing = false,
 ): Promise<Readonly<Record<string, unknown>>> {
   throwIfDeadlineExceeded(signal);
   await assertTrackedPathConfined(snapshot.root, path);
   const fullPath = join(snapshot.root, ...path.split("/"));
   let before: BigIntStats;
   try { before = await lstat(fullPath, { bigint: true }); }
-  catch { throw untrackedChangedWhileHashing(); }
+  catch (error) {
+    if (allowMissing && (error as NodeJS.ErrnoException).code === "ENOENT") {
+      return { path, kind: "missing" };
+    }
+    throw untrackedChangedWhileHashing();
+  }
   throwIfDeadlineExceeded(signal);
   const mode = Number(before.mode);
   if (before.isDirectory()) {
@@ -476,15 +530,15 @@ async function fingerprintUntrackedPath(
     if (!after.isSymbolicLink() || !samePathState(before, after)) throw untrackedChangedWhileHashing();
     return { path, kind: "untracked-symlink", mode, target: target.toString("base64") };
   }
-  let after: BigIntStats;
-  try { after = await lstat(fullPath, { bigint: true }); } catch { throw untrackedChangedWhileHashing(); }
-  throwIfDeadlineExceeded(signal);
-  if (!samePathState(before, after)) throw untrackedChangedWhileHashing();
   const kind = before.isFIFO() ? "fifo"
     : before.isSocket() ? "socket"
       : before.isBlockDevice() ? "block-device"
         : before.isCharacterDevice() ? "character-device" : "other";
-  return { path, kind: `untracked-${kind}`, mode };
+  throw new BridgeRejection({
+    code: "UNSUPPORTED_REPOSITORY_STATE",
+    message: "Untracked special filesystem entries cannot be safely content-proven",
+    details: { path, kind },
+  });
 }
 
 async function untrackedPathFingerprints(
@@ -518,6 +572,28 @@ function worktreeSnapshotIdFromFingerprints(
       .sort(([left], [right]) => compareText(left, right))
       .map(([, fingerprint]) => fingerprint),
   })).digest("hex");
+}
+
+function unownedWorktreeContentSnapshotIdFromFingerprints(
+  entries: readonly ParsedStatusEntry[],
+  fingerprints: ReadonlyMap<string, Readonly<Record<string, unknown>>>,
+): string {
+  return createHash("sha256").update("git-mcp-server:unowned-worktree-content:v1\0").update(JSON.stringify({
+    entries,
+    fingerprints: [...fingerprints.entries()]
+      .sort(([left], [right]) => compareText(left, right))
+      .map(([, fingerprint]) => fingerprint),
+  })).digest("hex");
+}
+
+function worktreeContentSnapshotIdFromFingerprints(
+  fingerprints: ReadonlyMap<string, Readonly<Record<string, unknown>>>,
+): string {
+  return createHash("sha256").update("git-mcp-server:worktree-content:v1\0").update(JSON.stringify(
+    [...fingerprints.entries()]
+      .sort(([left], [right]) => compareText(left, right))
+      .map(([, fingerprint]) => fingerprint),
+  )).digest("hex");
 }
 
 async function readParsedStatus(
@@ -560,6 +636,18 @@ export interface StatusWithTrackedWorktreeProof {
   readonly outsideWorktreeSnapshotId: string;
 }
 
+export interface WorktreeContentProof {
+  /** Exact Git-visible path universe authorized by the caller snapshot. */
+  readonly paths: readonly string[];
+  /** Filesystem kind, mode, bytes/target, and gitlink-state proof for that universe. */
+  readonly snapshotId: string;
+}
+
+export interface StatusWithWorktreeContentProof {
+  readonly status: StatusData;
+  readonly contentProof: WorktreeContentProof;
+}
+
 function publicStatus(
   snapshot: RepositorySnapshot,
   entries: readonly ParsedStatusEntry[],
@@ -586,16 +674,23 @@ export async function readStatusWithTrackedWorktreeProof(
 ): Promise<StatusWithTrackedWorktreeProof> {
   const excluded = new Set(excludedPaths);
   const { tracked, entries } = await readParsedStatus(runner, snapshot, signal);
-  const fingerprints = await trackedPathFingerprints(runner, snapshot, tracked, signal, true, hashBudget);
+  const fingerprints = new Map(await trackedPathFingerprints(runner, snapshot, tracked, signal, true, hashBudget));
+  for (const [path, fingerprint] of await untrackedPathFingerprints(snapshot, entries, new Set(), hashBudget, signal)) {
+    fingerprints.set(path, fingerprint);
+  }
+  for (const entry of entries) {
+    for (const path of [entry.path, entry.sourcePath]) {
+      if (path !== undefined && !fingerprints.has(path)) {
+        fingerprints.set(path, await fingerprintUntrackedPath(snapshot, path, hashBudget, signal, true));
+      }
+    }
+  }
   const snapshotId = worktreeSnapshotIdFromFingerprints(snapshot, entries, fingerprints);
   const outsideEntries = entries.filter((entry) => !excluded.has(entry.path)
     && (entry.sourcePath === undefined || !excluded.has(entry.sourcePath)));
   const outsideFingerprints = new Map(
     [...fingerprints].filter(([path]) => !excluded.has(path)),
   );
-  for (const [path, fingerprint] of await untrackedPathFingerprints(snapshot, entries, excluded, hashBudget, signal)) {
-    outsideFingerprints.set(path, fingerprint);
-  }
   return {
     status: publicStatus(snapshot, entries, snapshotId),
     outsideWorktreeSnapshotId: worktreeSnapshotIdFromFingerprints(
@@ -606,11 +701,75 @@ export async function readStatusWithTrackedWorktreeProof(
   };
 }
 
-/** Reads the porcelain status and returns a content-free, repeatable worktree snapshot. */
-export async function readStatus(runner: GitRunner, snapshot: RepositorySnapshot, signal?: AbortSignal): Promise<StatusData> {
+/**
+ * Reads one public status snapshot and binds it to a content-complete proof of
+ * every current Git-visible path. When requiredPaths is supplied, those paths
+ * remain in the declared universe even if a successful mutation makes them
+ * status-clean; newly Git-visible paths are always added to the proof.
+ * Ignored and empty-directory paths are outside Git's declared universe.
+ * Ordinary untracked directories are expanded to leaves by Git; directory
+ * records (including nested repositories), FIFOs, sockets, and devices reject.
+ */
+export async function readStatusWithWorktreeContentProof(
+  runner: GitRunner,
+  snapshot: RepositorySnapshot,
+  requiredPaths: readonly string[] = [],
+  signal?: AbortSignal,
+  hashBudget = createWorktreeHashBudget(),
+): Promise<StatusWithWorktreeContentProof> {
+  const entries = await readStatusEntries(runner, snapshot, signal);
+  const paths = new Set(requiredPaths);
+  for (const entry of entries) {
+    paths.add(entry.path);
+    if (entry.sourcePath !== undefined) paths.add(entry.sourcePath);
+  }
+  let sortedPaths = [...paths].sort(compareText);
+  const tracked = await trackedIndexEntries(runner, snapshot, new Set(sortedPaths), signal);
+  for (const path of tracked.keys()) paths.add(path);
+  sortedPaths = [...paths].sort(compareText);
+  const fingerprints = new Map<string, Readonly<Record<string, unknown>>>();
+  for (const path of sortedPaths) {
+    throwIfDeadlineExceeded(signal);
+    const indexEntries = tracked.get(path);
+    fingerprints.set(path, indexEntries === undefined
+      ? await fingerprintUntrackedPath(snapshot, path, hashBudget, signal, true)
+      : await fingerprintTrackedPath(runner, snapshot.root, path, indexEntries, signal, true, hashBudget));
+  }
+  const publicSnapshotId = worktreeSnapshotIdFromFingerprints(snapshot, entries, fingerprints);
+  return {
+    status: publicStatus(snapshot, entries, publicSnapshotId),
+    contentProof: Object.freeze({
+      paths: Object.freeze(sortedPaths),
+      snapshotId: worktreeContentSnapshotIdFromFingerprints(fingerprints),
+    }),
+  };
+}
+
+/** Complete filesystem-content proof for every Git-visible path outside one owned path set. */
+export async function readUnownedWorktreeContentSnapshotId(
+  runner: GitRunner,
+  snapshot: RepositorySnapshot,
+  excludedPaths: readonly string[],
+  signal?: AbortSignal,
+): Promise<string> {
+  const excluded = new Set(excludedPaths);
   const { tracked, entries } = await readParsedStatus(runner, snapshot, signal);
-  const snapshotId = await worktreeSnapshotId(runner, snapshot, entries, tracked, signal);
-  return publicStatus(snapshot, entries, snapshotId);
+  const budget = createWorktreeHashBudget();
+  const fingerprints = new Map(
+    [...await trackedPathFingerprints(runner, snapshot, tracked, signal, true, budget)]
+      .filter(([path]) => !excluded.has(path)),
+  );
+  for (const [path, fingerprint] of await untrackedPathFingerprints(snapshot, entries, excluded, budget, signal)) {
+    fingerprints.set(path, fingerprint);
+  }
+  const outsideEntries = entries.filter((entry) => !excluded.has(entry.path)
+    && (entry.sourcePath === undefined || !excluded.has(entry.sourcePath)));
+  return unownedWorktreeContentSnapshotIdFromFingerprints(outsideEntries, fingerprints);
+}
+
+/** Reads a content-complete snapshot of every non-ignored Git-visible worktree path. */
+export async function readStatus(runner: GitRunner, snapshot: RepositorySnapshot, signal?: AbortSignal): Promise<StatusData> {
+  return (await readStatusWithWorktreeContentProof(runner, snapshot, [], signal)).status;
 }
 
 function capUtf8(text: string, maxBytes: number): { readonly text: string; readonly capped: boolean } {

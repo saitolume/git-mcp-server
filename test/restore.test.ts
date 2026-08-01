@@ -449,7 +449,8 @@ test("worktree restore exposes a coordinator-safe preflight and one-shot mutatio
   );
   assert.deepEqual(prepared.paths, ["src/a.ts"]);
   assert.equal(runner.commands.some(({ args }) => args[0] === "restore"), false);
-  assert.deepEqual(runner.commands.at(-2)?.args, ["status", "--porcelain=v2", "--branch", "-z", "--untracked-files=all"]);
+  assert.deepEqual(runner.commands.at(-3)?.args, ["status", "--porcelain=v2", "--branch", "-z", "--untracked-files=all"]);
+  assert.deepEqual(runner.commands.at(-2)?.args, ["ls-files", "--cached", "-v", "-z"]);
   assert.deepEqual(runner.commands.at(-1)?.args, ["ls-files", "--stage", "-z"]);
 
   runner.commands.length = 0;
@@ -574,7 +575,8 @@ test("worktree restore issues the exact literal command after the final complete
   const mutationIndex = runner.commands.findIndex(({ args }) => args[0] === "restore");
   assert.ok(mutationIndex > 0);
   assert.deepEqual(runner.commands[mutationIndex]?.args, ["restore", "--worktree", "--", "src/a.ts"]);
-  assert.deepEqual(runner.commands[mutationIndex - 2]?.args, ["status", "--porcelain=v2", "--branch", "-z", "--untracked-files=all"]);
+  assert.deepEqual(runner.commands[mutationIndex - 3]?.args, ["status", "--porcelain=v2", "--branch", "-z", "--untracked-files=all"]);
+  assert.deepEqual(runner.commands[mutationIndex - 2]?.args, ["ls-files", "--cached", "-v", "-z"]);
   assert.deepEqual(runner.commands[mutationIndex - 1]?.args, ["ls-files", "--stage", "-z"]);
   assert.equal(runner.commands.some(({ args }) => ["clean", "reset", "checkout"].includes(args[0] ?? "")), false);
   assert.equal(runner.commands.some(({ args }) => args[0] === "restore" && args.some((arg) => arg === "--staged" || arg.startsWith("--source"))), false);

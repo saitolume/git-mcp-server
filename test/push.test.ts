@@ -1,21 +1,32 @@
 import assert from "node:assert/strict";
-import { access, chmod, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { access, chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { delimiter, join } from "node:path";
 import test from "node:test";
-import { ProvenMutationOutcome } from "../src/app/mutation-coordinator.js";
+import { MutationCoordinator, ProvenMutationOutcome } from "../src/app/mutation-coordinator.js";
+import { DefaultBridgeService } from "../src/app/bridge-service.js";
 import { BridgeRejection, pushDataSchema, type PushData } from "../src/domain/result.js";
 import { resolveGitExecutable } from "../src/git/environment.js";
 import {
+  executePreparedForcePush,
   executePreparedPush,
+  prepareForcePushOrigin,
   preparePushOrigin,
+  preparedForcePushObservation,
   preparedPushObservation,
   pushCurrentBranch,
   readRemoteBranchHead,
+  type PreparedForcePush,
   type PreparedPush,
 } from "../src/git/remote.js";
 import { inspectRepository, type RepositorySnapshot } from "../src/git/repository.js";
 import { GitRunner, type GitCommand, type GitCommandResult } from "../src/git/runner.js";
+import { initializeStatePaths, resolveStatePaths } from "../src/state/paths.js";
+import { SessionStore } from "../src/state/session-store.js";
+import { AuditLog } from "../src/state/audit.js";
+import { OperationJournal } from "../src/state/journal.js";
+import { RepositoryLock } from "../src/state/repository-lock.js";
+import { RepositoryRegistry } from "../src/state/repository-registry.js";
 
 function commandResult(overrides: Partial<GitCommandResult> = {}): GitCommandResult {
   return {
@@ -75,6 +86,34 @@ class AfterPushActionRunner extends GitRunner {
   }
 }
 
+class BeforePushActionRunner extends GitRunner {
+  readonly commands: GitCommand[] = [];
+  private acted = false;
+  constructor(private readonly delegate: GitRunner, private readonly action: () => Promise<void>) {
+    super(process.execPath, process.env);
+  }
+  override async run(command: GitCommand, signal?: AbortSignal): Promise<GitCommandResult> {
+    this.commands.push(command);
+    if (command.args[0] === "push" && !this.acted) {
+      this.acted = true;
+      await this.action();
+    }
+    return this.delegate.run(command, signal);
+  }
+}
+
+class PushThenDiagnosticRunner extends GitRunner {
+  readonly commands: GitCommand[] = [];
+  constructor(private readonly delegate: GitRunner) { super(process.execPath, process.env); }
+  override async run(command: GitCommand, signal?: AbortSignal): Promise<GitCommandResult> {
+    this.commands.push(command);
+    const result = await this.delegate.run(command, signal);
+    return command.args[0] === "push"
+      ? { ...result, stderr: "private completion diagnostic" }
+      : result;
+  }
+}
+
 class AfterFirstRemoteReadRunner extends GitRunner {
   readonly commands: GitCommand[] = [];
   private reads = 0;
@@ -125,18 +164,26 @@ interface PushFixture {
   readonly other: string;
   readonly bare: string;
   readonly origin: string;
+  readonly redirectedBare: string;
+  readonly redirectedOrigin: string;
+  readonly redirectedContact: string;
   readonly runner: TrackingRunner;
   readonly bootstrap: GitRunner;
   readonly initial: RepositorySnapshot;
 }
 
-async function fixture(t: test.TestContext): Promise<PushFixture> {
+async function fixture(
+  t: test.TestContext,
+  options: { readonly withRedirectedEndpoint?: boolean } = {},
+): Promise<PushFixture> {
   const root = await mkdtemp(join(tmpdir(), "git-mcp-server-push-"));
   t.after(async () => { await rm(root, { recursive: true, force: true }); });
   const bootstrap = new GitRunner(await resolveGitExecutable(), process.env);
   const local = join(root, "local");
   const other = join(root, "other");
   const bare = join(root, "remote.git");
+  const redirectedBare = join(root, "redirected.git");
+  const redirectedContact = join(root, "redirected-contact");
   const shim = join(root, "bin");
   await mkdir(local);
   await git(bootstrap, local, ["init", "--initial-branch=main"]);
@@ -146,6 +193,9 @@ async function fixture(t: test.TestContext): Promise<PushFixture> {
   await git(bootstrap, local, ["config", "core.hooksPath", ".hooks"]);
   await commit(bootstrap, local, "tracked.txt", "one\n");
   await git(bootstrap, root, ["init", "--bare", bare]);
+  if (options.withRedirectedEndpoint === true) {
+    await git(bootstrap, root, ["init", "--bare", redirectedBare]);
+  }
 
   const execPath = await git(bootstrap, root, ["--exec-path"]);
   await mkdir(shim);
@@ -157,21 +207,29 @@ async function fixture(t: test.TestContext): Promise<PushFixture> {
     + `const command = args.at(-1);\n`
     + `const host = args.at(-2);\n`
     + `const options = args.slice(0, -2).join(" ");\n`
-    + `if (host !== "git@fixture" || (options !== "" && options !== "-o SendEnv=GIT_PROTOCOL")) process.exit(90);\n`
+    + `if ((host !== "git@fixture" && host !== "git@redirected-fixture") || (options !== "" && options !== "-o SendEnv=GIT_PROTOCOL")) process.exit(90);\n`
     + `const uploadCommand = ${JSON.stringify(`git-upload-pack '${bare}'`)};\n`
     + `const receiveCommand = ${JSON.stringify(`git-receive-pack '${bare}'`)};\n`
-    + `const helper = command === uploadCommand ? ${JSON.stringify(upload)} : command === receiveCommand ? ${JSON.stringify(receive)} : null;\n`
+    + `const redirectedUploadCommand = ${JSON.stringify(`git-upload-pack '${redirectedBare}'`)};\n`
+    + `const redirectedReceiveCommand = ${JSON.stringify(`git-receive-pack '${redirectedBare}'`)};\n`
+    + `const original = host === "git@fixture" && (command === uploadCommand || command === receiveCommand);\n`
+    + `const redirected = host === "git@redirected-fixture" && (command === redirectedUploadCommand || command === redirectedReceiveCommand);\n`
+    + `const helper = original ? (command === uploadCommand ? ${JSON.stringify(upload)} : ${JSON.stringify(receive)}) : redirected ? (command === redirectedUploadCommand ? ${JSON.stringify(upload)} : ${JSON.stringify(receive)}) : null;\n`
     + `if (helper === null) process.exit(91);\n`
-    + `const child = spawnSync(helper, [${JSON.stringify(bare)}], { stdio: "inherit", env: process.env });\n`
+    + `if (redirected) require("node:fs").writeFileSync(${JSON.stringify(redirectedContact)}, "contacted\\n");\n`
+    + `const child = spawnSync(helper, [original ? ${JSON.stringify(bare)} : ${JSON.stringify(redirectedBare)}], { stdio: "inherit", env: process.env });\n`
     + `process.exit(child.status ?? 92);\n`;
   await writeFile(join(shim, "ssh"), ssh);
   await chmod(join(shim, "ssh"), 0o755);
   const runner = new TrackingRunner(await resolveGitExecutable(), { ...process.env, PATH: `${shim}${delimiter}${process.env.PATH ?? ""}` });
   const origin = `git@fixture:${bare}`;
+  const redirectedOrigin = `git@redirected-fixture:${redirectedBare}`;
   await git(runner, local, ["remote", "add", "origin", origin]);
   const initial = await inspectRepository(runner, local);
   runner.commands.length = 0;
-  return { root, local, other, bare, origin, runner, bootstrap, initial };
+  return {
+    root, local, other, bare, origin, redirectedBare, redirectedOrigin, redirectedContact, runner, bootstrap, initial,
+  };
 }
 
 async function cloneOther(value: PushFixture): Promise<void> {
@@ -201,6 +259,23 @@ async function addGitlink(value: PushFixture): Promise<RepositorySnapshot> {
 
 function request(snapshot: RepositorySnapshot, expectedRemoteHead: string | null) {
   return { expectedBranch: snapshot.branch!, expectedHead: snapshot.head, expectedRemoteHead };
+}
+
+function assertBoundPushCommand(
+  command: GitCommand | undefined,
+  expectedLease: string,
+  expectedEndpoint: string,
+  expectedRefspec: string,
+): void {
+  assert.ok(command);
+  const alias = command.args[2];
+  assert.match(alias ?? "", /^git-mcp-prepared:\/\/[0-9a-f-]{36}$/);
+  assert.deepEqual(command.args, ["push", expectedLease, alias, expectedRefspec]);
+  assert.deepEqual(command.hookExecution?.preparedPushEndpointBinding, {
+    alias,
+    endpoint: expectedEndpoint,
+  });
+  assert.equal(command.hookExecution?.prePushEndpoint, expectedEndpoint);
 }
 
 function rejection(error: unknown): BridgeRejection {
@@ -256,6 +331,462 @@ test("push origin preserves a valid astral branch ref", async () => {
   assert.deepEqual(runner.commands[0]?.args, ["ls-remote", "--heads", "origin", `refs/heads/${branch}`]);
 });
 
+test("force-with-lease replaces only the exact same-name origin branch", async (t) => {
+  const f = await fixture(t);
+  await git(f.runner, f.local, ["push", "origin", "main"]);
+  const oldRemoteHead = f.initial.head;
+  const tree = await git(f.runner, f.local, ["rev-parse", "HEAD^{tree}"]);
+  const rewrittenHead = await git(f.runner, f.local, ["commit-tree", tree], "rewritten root\n");
+  await git(f.runner, f.local, ["update-ref", "refs/heads/main", rewrittenHead, oldRemoteHead]);
+  const local = await inspectRepository(f.runner, f.local);
+  const statePaths = await initializeStatePaths(resolveStatePaths({
+    platform: "linux", homedir: join(f.root, "state"), env: {},
+  }));
+  const sessions = new SessionStore(statePaths);
+  f.runner.commands.length = 0;
+
+  const prepared = await prepareForcePushOrigin(f.runner, sessions, local, request(local, oldRemoteHead));
+  const observation = preparedForcePushObservation(prepared);
+  assert.match(observation.worktree_snapshot_id, /^[0-9a-f]{64}$/);
+  f.runner.commands.length = 0;
+  const execution = await executePreparedForcePush(f.runner, prepared);
+
+  assert.deepEqual(execution.data, { local_head: rewrittenHead, remote_head: rewrittenHead });
+  assert.equal(await git(f.runner, f.bare, ["rev-parse", "refs/heads/main"]), rewrittenHead);
+  const pushCommands = f.runner.commands.filter(({ args }) => args[0] === "push");
+  assert.equal(pushCommands.length, 1);
+  assertBoundPushCommand(pushCommands[0],
+    `--force-with-lease=refs/heads/main:${oldRemoteHead}`, f.origin, `${rewrittenHead}:refs/heads/main`);
+  await assert.rejects(executePreparedForcePush(f.runner, prepared), /invalid|consumed/i);
+  await assert.rejects(executePreparedForcePush(f.runner, {} as PreparedForcePush), /invalid|consumed/i);
+});
+
+test("force-with-lease publishes only the prepared object when local HEAD moves before Git starts", async (t) => {
+  const f = await fixture(t);
+  await git(f.runner, f.local, ["push", "origin", "main"]);
+  const approved = await commit(f.runner, f.local, "approved.txt", "approved\n");
+  const approvedTree = await git(f.runner, f.local, ["rev-parse", `${approved}^{tree}`]);
+  const raced = await git(f.runner, f.local, ["commit-tree", approvedTree], "raced root\n");
+  const local = await inspectRepository(f.runner, f.local);
+  const statePaths = await initializeStatePaths(resolveStatePaths({
+    platform: "linux", homedir: join(f.root, "local-race-state"), env: {},
+  }));
+  const prepared = await prepareForcePushOrigin(
+    f.runner,
+    new SessionStore(statePaths),
+    local,
+    request(local, f.initial.head),
+  );
+  const runner = new BeforePushActionRunner(f.runner, async () => {
+    await git(f.runner, f.local, ["update-ref", "refs/heads/main", raced, approved]);
+  });
+
+  let caught: unknown;
+  try { await executePreparedForcePush(runner, prepared); } catch (error) { caught = error; }
+
+  assert.equal(proven(caught).result.status, "indeterminate");
+  assert.equal(await git(f.runner, f.bare, ["rev-parse", "refs/heads/main"]), approved);
+  assert.notEqual(await git(f.runner, f.bare, ["rev-parse", "refs/heads/main"]), raced);
+  assertBoundPushCommand(runner.commands[0],
+    `--force-with-lease=refs/heads/main:${f.initial.head}`, f.origin, `${approved}:refs/heads/main`);
+});
+
+test("force-with-lease uses only the prepared endpoint when origin and pushurl change before Git starts", async (t) => {
+  const f = await fixture(t, { withRedirectedEndpoint: true });
+  await git(f.runner, f.local, ["push", "origin", "main"]);
+  const approved = await commit(f.runner, f.local, "approved-endpoint.txt", "approved endpoint\n");
+  const local = await inspectRepository(f.runner, f.local);
+  const hookCapture = join(f.root, "force-hook-capture");
+  await hook(f.local, [
+    'test -z "${GIT_CONFIG_COUNT:-}"',
+    'test -z "${GIT_CONFIG_KEY_0:-}"',
+    'test -z "${GIT_CONFIG_VALUE_0:-}"',
+    'test -z "${GIT_MCP_PREPARED_PUSH_ENDPOINT:-}"',
+    `printf '%s\\n%s\\n' "$1" "$2" >> ${JSON.stringify(hookCapture)}`,
+    `cat >> ${JSON.stringify(hookCapture)}`,
+  ].join("\n"));
+  const statePaths = await initializeStatePaths(resolveStatePaths({
+    platform: "linux", homedir: join(f.root, "endpoint-race-state"), env: {},
+  }));
+  const prepared = await prepareForcePushOrigin(
+    f.runner,
+    new SessionStore(statePaths),
+    local,
+    request(local, f.initial.head),
+  );
+  const runner = new BeforePushActionRunner(f.runner, async () => {
+    await git(f.runner, f.local, ["remote", "set-url", "origin", f.redirectedOrigin]);
+    await git(f.runner, f.local, ["remote", "set-url", "--push", "origin", f.redirectedOrigin]);
+  });
+
+  let caught: unknown;
+  try { await executePreparedForcePush(runner, prepared); } catch (error) { caught = error; }
+
+  assert.equal(proven(caught).result.status, "indeterminate");
+  assert.equal(await git(f.runner, f.bare, ["rev-parse", "refs/heads/main"]), approved);
+  assert.equal(await hasRef(f.bootstrap, f.redirectedBare, "refs/heads/main"), false);
+  await assert.rejects(access(f.redirectedContact));
+  assert.equal(await readFile(hookCapture, "utf8"), [
+    "origin",
+    f.origin,
+    `${approved} ${approved} refs/heads/main ${f.initial.head}`,
+    "",
+  ].join("\n"));
+  assertBoundPushCommand(runner.commands[0],
+    `--force-with-lease=refs/heads/main:${f.initial.head}`, f.origin, `${approved}:refs/heads/main`);
+});
+
+test("push origin preserves its named hook contract when origin and pushurl change before Git starts", async (t) => {
+  const f = await fixture(t, { withRedirectedEndpoint: true });
+  await git(f.runner, f.local, ["push", "origin", "main"]);
+  const approved = await commit(f.runner, f.local, "normal-approved-endpoint.txt", "normal approved endpoint\n");
+  const local = await inspectRepository(f.runner, f.local);
+  const hookCapture = join(f.root, "normal-hook-capture");
+  await hook(f.local, [
+    'test -z "${GIT_CONFIG_COUNT:-}"',
+    'test -z "${GIT_CONFIG_KEY_0:-}"',
+    'test -z "${GIT_CONFIG_VALUE_0:-}"',
+    'test -z "${GIT_MCP_PREPARED_PUSH_ENDPOINT:-}"',
+    `printf '%s\\n%s\\n' "$1" "$2" >> ${JSON.stringify(hookCapture)}`,
+    `cat >> ${JSON.stringify(hookCapture)}`,
+  ].join("\n"));
+  const prepared = await preparePushOrigin(f.runner, local, request(local, f.initial.head));
+  const runner = new BeforePushActionRunner(f.runner, async () => {
+    await git(f.runner, f.local, ["remote", "set-url", "origin", f.redirectedOrigin]);
+    await git(f.runner, f.local, ["remote", "set-url", "--push", "origin", f.redirectedOrigin]);
+  });
+
+  let caught: unknown;
+  try { await executePreparedPush(runner, prepared); } catch (error) { caught = error; }
+
+  assert.equal(proven(caught).result.status, "indeterminate");
+  assert.equal(await git(f.runner, f.bare, ["rev-parse", "refs/heads/main"]), approved);
+  assert.equal(await hasRef(f.bootstrap, f.redirectedBare, "refs/heads/main"), false);
+  await assert.rejects(access(f.redirectedContact));
+  assert.equal(await readFile(hookCapture, "utf8"), [
+    "origin",
+    f.origin,
+    `${approved} ${approved} refs/heads/main ${f.initial.head}`,
+    "",
+  ].join("\n"));
+  assertBoundPushCommand(runner.commands[0],
+    `--force-with-lease=refs/heads/main:${f.initial.head}`, f.origin, `${approved}:refs/heads/main`);
+});
+
+for (const operation of ["normal", "force-with-lease"] as const) {
+  test(`${operation} push cannot be redirected by a late pushInsteadOf rule`, async (t) => {
+    const f = await fixture(t, { withRedirectedEndpoint: true });
+    await git(f.runner, f.local, ["push", "origin", "main"]);
+    await git(f.runner, f.local, ["push", f.redirectedOrigin, "main"]);
+    const baseline = f.initial.head;
+    const approved = await commit(f.runner, f.local, `${operation}-late-rewrite.txt`, `${operation} late rewrite\n`);
+    const local = await inspectRepository(f.runner, f.local);
+    const statePaths = await initializeStatePaths(resolveStatePaths({
+      platform: "linux", homedir: join(f.root, `${operation}-late-rewrite-state`), env: {},
+    }));
+    const prepared = operation === "normal"
+      ? await preparePushOrigin(f.runner, local, request(local, baseline))
+      : await prepareForcePushOrigin(f.runner, new SessionStore(statePaths), local, request(local, baseline));
+    const runner = new BeforePushActionRunner(f.runner, async () => {
+      await git(f.runner, f.local, ["config", `url.${f.redirectedOrigin}.pushInsteadOf`, f.origin]);
+    });
+
+    let caught: unknown;
+    try {
+      if (operation === "normal") await executePreparedPush(runner, prepared as PreparedPush);
+      else await executePreparedForcePush(runner, prepared as PreparedForcePush);
+    } catch (error) { caught = error; }
+
+    assert.equal(proven(caught).result.status, "indeterminate");
+    assert.equal(await git(f.runner, f.bare, ["rev-parse", "refs/heads/main"]), approved);
+    assert.equal(await git(f.runner, f.redirectedBare, ["rev-parse", "refs/heads/main"]), baseline);
+  });
+}
+
+test("force-with-lease durably replays observed evidence without a second push", async (t) => {
+  const f = await fixture(t);
+  await git(f.runner, f.local, ["push", "origin", "main"]);
+  const oldRemoteHead = f.initial.head;
+  const tree = await git(f.runner, f.local, ["rev-parse", "HEAD^{tree}"]);
+  const rewrittenHead = await git(f.runner, f.local, ["commit-tree", tree], "replayed rewrite\n");
+  await git(f.runner, f.local, ["update-ref", "refs/heads/main", rewrittenHead, oldRemoteHead]);
+  const statePaths = await initializeStatePaths(resolveStatePaths({
+    platform: "linux", homedir: join(f.root, "service-state"), env: {},
+  }));
+  const lock = new RepositoryLock(statePaths);
+  const journal = new OperationJournal(statePaths);
+  const sessions = new SessionStore(statePaths);
+  const coordinator = new MutationCoordinator({
+    runner: f.runner,
+    lock,
+    journal,
+    audit: new AuditLog(statePaths),
+    registry: new RepositoryRegistry(statePaths),
+  });
+  const service = new DefaultBridgeService({ runner: f.runner, lock, journal, sessions, coordinator });
+  const input = {
+    repository: f.local,
+    request_id: "018f47d2-7b2a-7d75-b9dd-5ea8abca0151",
+    expected_branch: "main",
+    expected_head: rewrittenHead,
+    expected_remote_head: oldRemoteHead,
+  };
+  f.runner.commands.length = 0;
+
+  const first = await service.git_push_force_with_lease(input);
+  const pushCount = f.runner.commands.filter(({ args }) => args[0] === "push").length;
+  const replay = await service.git_push_force_with_lease(input);
+  const lookup = await service.git_operation_get({ request_id: input.request_id });
+
+  assert.equal(first.status, "succeeded");
+  assert.equal(first.operation, "git_push_force_with_lease");
+  assert.deepEqual(first.data, { local_head: rewrittenHead, remote_head: rewrittenHead });
+  assert.equal((first.observed_before as { remote_head?: string }).remote_head, oldRemoteHead);
+  assert.match((first.observed_before as { worktree_snapshot_id?: string }).worktree_snapshot_id ?? "", /^[0-9a-f]{64}$/);
+  assert.deepEqual(first.observed_after, { local_head: rewrittenHead, remote_head: rewrittenHead });
+  assert.deepEqual(replay, first);
+  assert.deepEqual(lookup, first);
+  assert.equal(pushCount, 1);
+  assert.equal(f.runner.commands.filter(({ args }) => args[0] === "push").length, 1);
+  assert.equal(JSON.stringify(first).includes(f.origin), false);
+  assert.equal(JSON.stringify(first).includes(f.bare), false);
+});
+
+test("force-with-lease rejects remote drift during final preflight", async (t) => {
+  const f = await fixture(t);
+  await git(f.runner, f.local, ["push", "origin", "main"]);
+  const before = await inspectRepository(f.runner, f.local);
+  const statePaths = await initializeStatePaths(resolveStatePaths({
+    platform: "linux", homedir: join(f.root, "drift-state"), env: {},
+  }));
+  const runner = new AfterFirstRemoteReadRunner(f.runner, async () => { await advanceOther(f); });
+
+  await assert.rejects(
+    prepareForcePushOrigin(runner, new SessionStore(statePaths), before, request(before, before.head)),
+    (error) => error instanceof BridgeRejection && error.error.code === "REMOTE_HEAD_MISMATCH",
+  );
+  assert.equal(runner.commands.some(({ args }) => args[0] === "push"), false);
+});
+
+test("force-with-lease rejects a remote branch when absence was expected", async (t) => {
+  const f = await fixture(t);
+  await git(f.runner, f.local, ["push", "origin", "main"]);
+  const local = await inspectRepository(f.runner, f.local);
+  const statePaths = await initializeStatePaths(resolveStatePaths({
+    platform: "linux", homedir: join(f.root, "absence-state"), env: {},
+  }));
+  f.runner.commands.length = 0;
+
+  await assert.rejects(
+    prepareForcePushOrigin(f.runner, new SessionStore(statePaths), local, request(local, null)),
+    (error) => error instanceof BridgeRejection && error.error.code === "REMOTE_HEAD_MISMATCH",
+  );
+  assert.equal(f.runner.commands.some(({ args }) => args[0] === "push"), false);
+});
+
+test("force-with-lease is indeterminate when dirty worktree content drifts after preparation", async (t) => {
+  const f = await fixture(t);
+  await writeFile(join(f.local, "scratch.txt"), "before\n");
+  const local = await inspectRepository(f.runner, f.local);
+  const statePaths = await initializeStatePaths(resolveStatePaths({
+    platform: "linux", homedir: join(f.root, "dirty-state"), env: {},
+  }));
+  const prepared = await prepareForcePushOrigin(f.runner, new SessionStore(statePaths), local, request(local, null));
+  await writeFile(join(f.local, "scratch.txt"), "after\n");
+
+  let caught: unknown;
+  try { await executePreparedForcePush(f.runner, prepared); } catch (error) { caught = error; }
+  const outcome = proven(caught).result;
+  assert.equal(outcome.status, "indeterminate");
+  assert.equal(outcome.operation, "git_push_force_with_lease");
+  assert.equal(outcome.error?.code, "OPERATION_INDETERMINATE");
+  assert.equal(await git(f.runner, f.bare, ["rev-parse", "refs/heads/main"]), local.head);
+});
+
+test("force-with-lease rejects an active bridge session before remote mutation", async (t) => {
+  const f = await fixture(t);
+  const statePaths = await initializeStatePaths(resolveStatePaths({
+    platform: "linux", homedir: join(f.root, "session-state"), env: {},
+  }));
+  const sessions = new SessionStore(statePaths);
+  await sessions.createStageSession({
+    kind: "stage",
+    stageId: "active-force-stage",
+    repositoryId: f.initial.repositoryId,
+    branch: "main",
+    baseHead: f.initial.head,
+    initialIndexTree: f.initial.indexTree,
+    currentIndexTree: f.initial.indexTree,
+    ownedPaths: [],
+    createdAt: "2026-08-01T00:00:00.000Z",
+    updatedAt: "2026-08-01T00:00:00.000Z",
+  });
+  f.runner.commands.length = 0;
+
+  await assert.rejects(
+    prepareForcePushOrigin(f.runner, sessions, f.initial, request(f.initial, null)),
+    (error) => error instanceof BridgeRejection && error.error.code === "SESSION_MISMATCH",
+  );
+  assert.equal(f.runner.commands.some(({ args }) => args[0] === "push"), false);
+});
+
+test("force-with-lease cannot publish tags or delete another remote branch", async (t) => {
+  const f = await fixture(t);
+  await git(f.runner, f.local, ["push", "origin", "main"]);
+  await git(f.runner, f.local, ["push", "origin", `${f.initial.head}:refs/heads/keep`]);
+  await git(f.runner, f.local, ["tag", "local-only"]);
+  const tree = await git(f.runner, f.local, ["rev-parse", "HEAD^{tree}"]);
+  const rewrittenHead = await git(f.runner, f.local, ["commit-tree", tree], "policy rewrite\n");
+  await git(f.runner, f.local, ["update-ref", "refs/heads/main", rewrittenHead, f.initial.head]);
+  const local = await inspectRepository(f.runner, f.local);
+  const statePaths = await initializeStatePaths(resolveStatePaths({
+    platform: "linux", homedir: join(f.root, "ref-policy-state"), env: {},
+  }));
+  f.runner.commands.length = 0;
+
+  await executePreparedForcePush(f.runner, await prepareForcePushOrigin(
+    f.runner,
+    new SessionStore(statePaths),
+    local,
+    request(local, f.initial.head),
+  ));
+
+  assert.equal(await git(f.runner, f.bare, ["rev-parse", "refs/heads/keep"]), f.initial.head);
+  assert.equal(await hasRef(f.runner, f.bare, "refs/tags/local-only"), false);
+  const mutation = f.runner.commands.find(({ args }) => args[0] === "push");
+  assertBoundPushCommand(mutation,
+    `--force-with-lease=refs/heads/main:${f.initial.head}`, f.origin, `${rewrittenHead}:refs/heads/main`);
+});
+
+test("force-with-lease runs native pre-push hooks and redacts rejection diagnostics", async (t) => {
+  const f = await fixture(t);
+  await git(f.runner, f.local, ["push", "origin", "main"]);
+  const oldRemoteHead = f.initial.head;
+  await commit(f.runner, f.local, "next.txt", "next\n");
+  const local = await inspectRepository(f.runner, f.local);
+  await hook(f.local, [
+    'test "$1" = "origin"',
+    `test "$2" = ${JSON.stringify(f.origin)}`,
+    'echo "credential=https://secret.example/token private-hook-path" >&2',
+    "exit 1",
+  ].join("\n"));
+  const statePaths = await initializeStatePaths(resolveStatePaths({
+    platform: "linux", homedir: join(f.root, "hook-state"), env: {},
+  }));
+  const prepared = await prepareForcePushOrigin(
+    f.runner,
+    new SessionStore(statePaths),
+    local,
+    request(local, oldRemoteHead),
+  );
+
+  let caught: unknown;
+  try { await executePreparedForcePush(f.runner, prepared); } catch (error) { caught = error; }
+  const outcome = proven(caught).result;
+  assert.equal(outcome.status, "failed");
+  assert.equal(outcome.operation, "git_push_force_with_lease");
+  assert.equal(outcome.error?.code, "GIT_FAILED");
+  assert.equal(JSON.stringify(outcome).includes("secret.example"), false);
+  assert.equal(JSON.stringify(outcome).includes("private-hook-path"), false);
+  assert.equal(await git(f.runner, f.bare, ["rev-parse", "refs/heads/main"]), oldRemoteHead);
+});
+
+test("force-with-lease proves no update after an interrupted private transport failure", async (t) => {
+  const f = await fixture(t);
+  const runner = new PushOutcomeRunner(f.runner, commandResult({
+    exitCode: null,
+    aborted: true,
+    stderr: "https://user:token@private.example/repository.git",
+  }));
+  const statePaths = await initializeStatePaths(resolveStatePaths({
+    platform: "linux", homedir: join(f.root, "interrupted-state"), env: {},
+  }));
+  const prepared = await prepareForcePushOrigin(
+    runner,
+    new SessionStore(statePaths),
+    f.initial,
+    request(f.initial, null),
+  );
+
+  let caught: unknown;
+  try { await executePreparedForcePush(runner, prepared); } catch (error) { caught = error; }
+  const outcome = proven(caught).result;
+  assert.equal(outcome.status, "failed");
+  assert.equal(outcome.operation, "git_push_force_with_lease");
+  assert.equal(outcome.error?.code, "GIT_FAILED");
+  assert.equal(JSON.stringify(outcome).includes("token"), false);
+  assert.equal(JSON.stringify(outcome).includes("private.example"), false);
+  assert.equal(await readRemoteBranchHead(f.runner, f.local, "main"), null);
+  assert.equal(runner.commands.filter(({ args }) => args[0] === "push").length, 1);
+});
+
+test("force-with-lease reports proven updates with sanitized incomplete diagnostics", async (t) => {
+  const f = await fixture(t);
+  const runner = new PushThenDiagnosticRunner(f.runner);
+  const statePaths = await initializeStatePaths(resolveStatePaths({
+    platform: "linux", homedir: join(f.root, "diagnostic-state"), env: {},
+  }));
+  const prepared = await prepareForcePushOrigin(
+    runner,
+    new SessionStore(statePaths),
+    f.initial,
+    request(f.initial, null),
+  );
+
+  const execution = await executePreparedForcePush(runner, prepared);
+
+  assert.deepEqual(execution.data, { local_head: f.initial.head, remote_head: f.initial.head });
+  assert.deepEqual(execution.warnings, ["Git push completion was not clean after the remote update was proven"]);
+  assert.equal(JSON.stringify(execution).includes("private completion"), false);
+  assert.equal(await git(f.runner, f.bare, ["rev-parse", "refs/heads/main"]), f.initial.head);
+});
+
+test("force-with-lease rejects an effective origin endpoint override before mutation", async (t) => {
+  const f = await fixture(t);
+  await git(f.runner, f.local, ["remote", "set-url", "--push", "origin", "git@private.example:org/repository.git"]);
+  const local = await inspectRepository(f.runner, f.local);
+  const statePaths = await initializeStatePaths(resolveStatePaths({
+    platform: "linux", homedir: join(f.root, "policy-state"), env: {},
+  }));
+  f.runner.commands.length = 0;
+
+  await assert.rejects(
+    prepareForcePushOrigin(f.runner, new SessionStore(statePaths), local, request(local, null)),
+    (error) => error instanceof BridgeRejection
+      && error.error.code === "REMOTE_URL_REJECTED"
+      && !JSON.stringify(error.error).includes("private.example"),
+  );
+  assert.equal(f.runner.commands.some(({ args }) => args[0] === "push"), false);
+});
+
+test("force-with-lease exact CAS refuses an advance after preparation", async (t) => {
+  const f = await fixture(t);
+  await git(f.runner, f.local, ["push", "origin", "main"]);
+  const oldRemoteHead = f.initial.head;
+  await commit(f.runner, f.local, "local.txt", "local\n");
+  const local = await inspectRepository(f.runner, f.local);
+  const statePaths = await initializeStatePaths(resolveStatePaths({
+    platform: "linux", homedir: join(f.root, "cas-state"), env: {},
+  }));
+  const prepared = await prepareForcePushOrigin(
+    f.runner,
+    new SessionStore(statePaths),
+    local,
+    request(local, oldRemoteHead),
+  );
+  const advanced = await advanceOther(f);
+  f.runner.commands.length = 0;
+
+  let caught: unknown;
+  try { await executePreparedForcePush(f.runner, prepared); } catch (error) { caught = error; }
+  const outcome = proven(caught).result;
+  assert.equal(outcome.status, "indeterminate");
+  assert.equal(outcome.error?.code, "OPERATION_INDETERMINATE");
+  assert.equal(await git(f.runner, f.bare, ["rev-parse", "refs/heads/main"]), advanced);
+  assertBoundPushCommand(f.runner.commands[0],
+    `--force-with-lease=refs/heads/main:${oldRemoteHead}`, f.origin, `${local.head}:refs/heads/main`);
+});
+
 test("push origin creates an expected-absent branch through one opaque exact lease", async (t) => {
   const f = await fixture(t);
   const prepared = await preparePushOrigin(f.runner, f.initial, request(f.initial, null));
@@ -269,9 +800,8 @@ test("push origin creates an expected-absent branch through one opaque exact lea
   f.runner.commands.length = 0;
 
   const execution = await executePreparedPush(f.runner, prepared);
-  assert.deepEqual(f.runner.commands[0]?.args, [
-    "push", "--force-with-lease=refs/heads/main:", "origin", "HEAD:refs/heads/main",
-  ]);
+  assertBoundPushCommand(f.runner.commands[0],
+    "--force-with-lease=refs/heads/main:", f.origin, `${f.initial.head}:refs/heads/main`);
   assert.equal(f.runner.commands.filter(({ args }) => args[0] === "push").length, 1);
   assert.equal(f.runner.commands.some(({ args }) => args.some((arg) => ["--force", "--delete", "--set-upstream", "--tags"].includes(arg))), false);
   assert.deepEqual(execution.data, { local_head: f.initial.head, remote_head: f.initial.head });
@@ -440,9 +970,8 @@ test("push origin lease rejects an ancestor advance after preparation", async (t
   assert.equal(outcome.status, "indeterminate");
   assert.equal(outcome.error?.code, "OPERATION_INDETERMINATE");
   assert.equal(await git(f.runner, f.bare, ["rev-parse", "refs/heads/main"]), advanced);
-  assert.deepEqual(f.runner.commands[0]?.args, [
-    "push", `--force-with-lease=refs/heads/main:${f.initial.head}`, "origin", "HEAD:refs/heads/main",
-  ]);
+  assertBoundPushCommand(f.runner.commands[0],
+    `--force-with-lease=refs/heads/main:${f.initial.head}`, f.origin, `${local.head}:refs/heads/main`);
 });
 
 test("push origin lease rejects an expected-absence collision after preparation", async (t) => {
@@ -458,15 +987,19 @@ test("push origin lease rejects an expected-absence collision after preparation"
   assert.equal(outcome.status, "indeterminate");
   assert.equal(outcome.error?.code, "OPERATION_INDETERMINATE");
   assert.equal(await git(f.runner, f.bare, ["rev-parse", "refs/heads/main"]), f.initial.head);
-  assert.deepEqual(f.runner.commands[0]?.args, [
-    "push", "--force-with-lease=refs/heads/main:", "origin", "HEAD:refs/heads/main",
-  ]);
+  assertBoundPushCommand(f.runner.commands[0],
+    "--force-with-lease=refs/heads/main:", f.origin, `${local.head}:refs/heads/main`);
 });
 
 test("push origin reports pre-push rejection and transport failure only after proving the remote unchanged", async (t) => {
   await t.test("pre-push hook", async (t) => {
     const f = await fixture(t);
-    await hook(f.local, 'echo "private hook diagnostic" >&2\nexit 1');
+    await hook(f.local, [
+      'test "$1" = "origin"',
+      `test "$2" = ${JSON.stringify(f.origin)}`,
+      'echo "private hook diagnostic" >&2',
+      "exit 1",
+    ].join("\n"));
     const prepared = await preparePushOrigin(f.runner, f.initial, request(f.initial, null));
     let caught: unknown;
     try { await executePreparedPush(f.runner, prepared); } catch (error) { caught = error; }
@@ -540,9 +1073,8 @@ test("push origin uses the canonical full branch ref despite short-name ambiguit
   const prepared = await preparePushOrigin(f.runner, snapshot, request(snapshot, null));
   f.runner.commands.length = 0;
   const execution = await executePreparedPush(f.runner, prepared);
-  assert.deepEqual(f.runner.commands[0]?.args, [
-    "push", "--force-with-lease=refs/heads/heads/main:", "origin", "HEAD:refs/heads/heads/main",
-  ]);
+  assertBoundPushCommand(f.runner.commands[0],
+    "--force-with-lease=refs/heads/heads/main:", f.origin, `${snapshot.head}:refs/heads/heads/main`);
   assert.equal(await git(f.runner, f.bare, ["rev-parse", "refs/heads/heads/main"]), execution.data.local_head);
 });
 

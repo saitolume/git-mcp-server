@@ -49,7 +49,7 @@ async function createRepository(t: test.TestContext): Promise<{ directory: strin
   return { directory, runner };
 }
 
-function isRejection(code: "INVALID_INPUT" | "PATH_OUTSIDE_REPOSITORY") {
+function isRejection(code: "INVALID_INPUT" | "PATH_OUTSIDE_REPOSITORY" | "UNSUPPORTED_REPOSITORY_STATE") {
   return (error: unknown): boolean => error instanceof BridgeRejection && error.error.code === code;
 }
 
@@ -108,6 +108,34 @@ test("git status and both git diff modes are read-only across index and object s
       assert.deepEqual(await repositoryWriteState(directory), before);
     });
   }
+});
+
+test("status rejects an index visibility change between its visibility and porcelain reads", async (t) => {
+  const { directory, runner } = await createRepository(t);
+  const snapshot = await inspectRepository(runner, directory);
+  const gitExecutable = await resolveGitExecutable();
+  class VisibilityRaceRunner extends GitRunner {
+    private triggered = false;
+
+    override async run(command: GitCommand, signal?: AbortSignal): Promise<GitCommandResult> {
+      const response = await super.run(command, signal);
+      if (!this.triggered && command.args.join(" ") === "ls-files --cached -v -z") {
+        this.triggered = true;
+        await writeFile(join(directory, "README.md"), "hidden mutation\n");
+        const hidden = await super.run({
+          cwd: directory,
+          args: ["update-index", "--assume-unchanged", "--", "README.md"],
+          timeoutMs: 10_000,
+          maxOutputBytes: 32_768,
+        });
+        assert.equal(hidden.exitCode, 0, hidden.stderr);
+      }
+      return response;
+    }
+  }
+  const racingRunner = new VisibilityRaceRunner(gitExecutable, process.env);
+
+  await assert.rejects(readStatus(racingRunner, snapshot), isRejection("UNSUPPORTED_REPOSITORY_STATE"));
 });
 
 function statusText(): string {
@@ -406,6 +434,77 @@ test("status snapshot changes for same-path worktree content edits", async (t) =
   assert.notEqual(second.worktree_snapshot_id, first.worktree_snapshot_id);
 });
 
+test("status snapshot changes for same-path untracked regular content edits", async (t) => {
+  const { directory, runner } = await createRepository(t);
+  const snapshot = await inspectRepository(runner, directory);
+  await writeFile(join(directory, "untracked.txt"), "first\n");
+  const first = await readStatus(runner, snapshot);
+
+  await writeFile(join(directory, "untracked.txt"), "second\n");
+  const second = await readStatus(runner, snapshot);
+
+  assert.notEqual(second.worktree_snapshot_id, first.worktree_snapshot_id);
+});
+
+test("status snapshot covers untracked symlink targets, add-delete, and type changes", async (t) => {
+  const { directory, runner } = await createRepository(t);
+  const snapshot = await inspectRepository(runner, directory);
+  const path = join(directory, "untracked-leaf");
+  await symlink("first-target", path);
+  const first = await readStatus(runner, snapshot);
+  await unlink(path);
+  await symlink("second-target", path);
+  const changedTarget = await readStatus(runner, snapshot);
+  await unlink(path);
+  const deleted = await readStatus(runner, snapshot);
+  await writeFile(path, "regular\n");
+  const changedType = await readStatus(runner, snapshot);
+
+  assert.notEqual(changedTarget.worktree_snapshot_id, first.worktree_snapshot_id);
+  assert.notEqual(deleted.worktree_snapshot_id, changedTarget.worktree_snapshot_id);
+  assert.notEqual(changedType.worktree_snapshot_id, deleted.worktree_snapshot_id);
+  assert.notEqual(changedType.worktree_snapshot_id, changedTarget.worktree_snapshot_id);
+});
+
+test("status snapshot distinguishes malformed UTF-8 bytes in tracked symlink targets", async (t) => {
+  const { directory, runner } = await createRepository(t);
+  const path = join(directory, "tracked-link");
+  await symlink(Buffer.from("tracked"), path);
+  await runGit(runner, directory, ["add", "tracked-link"]);
+  await runGit(runner, directory, ["commit", "-m", "track symlink"]);
+  const snapshot = await inspectRepository(runner, directory);
+
+  await unlink(path);
+  await symlink(Buffer.from([0xff]), path);
+  const first = await readStatus(runner, snapshot);
+  await unlink(path);
+  await symlink(Buffer.from([0xfe]), path);
+  const second = await readStatus(runner, snapshot);
+
+  assert.notEqual(second.worktree_snapshot_id, first.worktree_snapshot_id);
+});
+
+test("status expands untracked directories and rejects nested repositories and tracked FIFOs", async (t) => {
+  const { directory, runner } = await createRepository(t);
+  const snapshot = await inspectRepository(runner, directory);
+  await mkdir(join(directory, "untracked-directory"));
+  await writeFile(join(directory, "untracked-directory", "leaf"), "leaf\n");
+  const leafStatus = await readStatus(runner, snapshot);
+  assert.ok(leafStatus.entries.some((entry) => entry.path === "untracked-directory/leaf"));
+  await rm(join(directory, "untracked-directory"), { recursive: true, force: true });
+
+  await mkdir(join(directory, "nested"));
+  await runGit(runner, join(directory, "nested"), ["init"]);
+  await assert.rejects(readStatus(runner, snapshot), isRejection("UNSUPPORTED_REPOSITORY_STATE"));
+  await rm(join(directory, "nested"), { recursive: true, force: true });
+
+  const fifo = join(directory, "src", "a.ts");
+  await unlink(fifo);
+  const created = spawnSync("mkfifo", [fifo], { encoding: "utf8" });
+  assert.equal(created.status, 0, created.stderr);
+  await assert.rejects(readStatus(runner, snapshot), isRejection("UNSUPPORTED_REPOSITORY_STATE"));
+});
+
 test("status parser handles ordinary, renamed, unmerged, and untracked records", async (t) => {
   const { directory, runner } = await createRepository(t);
   await writeFile(join(directory, "README.md"), "ordinary\\n");
@@ -494,6 +593,7 @@ test("status rejects malformed porcelain records and missing ls-files terminator
 
   const missingTerminator = new ControlledRunner((command) => command.args[0] === "status"
     ? result({ stdout: statusText() })
+    : command.args.includes("-v") ? result({ stdout: "H README.md\0" })
     : result({ stdout: `100644 ${"a".repeat(40)} 0\tREADME.md` }));
   await assert.rejects(readStatus(missingTerminator, snapshotFor(directory)), /malformed Git output: git ls-files/);
 });
@@ -518,6 +618,7 @@ test("gitlink checkout HEAD participates in the worktree snapshot", async (t) =>
   let confirmedNestedRoot = false;
   const runner = new ControlledRunner((command) => {
     if (command.args[0] === "status") return result({ stdout: statusText() });
+    if (command.args[0] === "ls-files" && command.args.includes("-v")) return result({ stdout: "H module\0" });
     if (command.args[0] === "ls-files") return result({ stdout: `160000 ${"a".repeat(40)} 0\tmodule\0` });
     if (command.args.join(" ") === "rev-parse --path-format=absolute --show-toplevel") {
       confirmedNestedRoot = true;
@@ -558,7 +659,9 @@ test("status aborts before opening an empty tracked file", async (t) => {
   const directory = await temporaryDirectory(t);
   await writeFile(join(directory, "empty.txt"), "");
   const runner = new ControlledRunner((command) => command.args[0] === "status"
-    ? result({ stdout: statusText() }) : result({ stdout: `100644 ${"a".repeat(40)} 0\tempty.txt\0` }));
+    ? result({ stdout: statusText() })
+    : command.args.includes("-v") ? result({ stdout: "H empty.txt\0" })
+    : result({ stdout: `100644 ${"a".repeat(40)} 0\tempty.txt\0` }));
   const controller = new AbortController();
   controller.abort(new Error("cancelled"));
 
@@ -584,6 +687,7 @@ test("gitlink control failures never become uninitialized or broken snapshots", 
     for (const failure of failures) {
       const runner = new ControlledRunner((command) => {
         if (command.args[0] === "status") return result({ stdout: statusText() });
+        if (command.args[0] === "ls-files" && command.args.includes("-v")) return result({ stdout: "H module\0" });
         if (command.args[0] === "ls-files") return result({ stdout: `160000 ${"a".repeat(40)} 0\tmodule\0` });
         if (command.args.join(" ") === "rev-parse --path-format=absolute --show-toplevel") {
           return phase === "top" ? failure : result({ stdout: `${join(directory, "module")}\n` });

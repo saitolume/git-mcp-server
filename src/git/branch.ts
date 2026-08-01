@@ -206,7 +206,8 @@ async function readLocalBranchHead(
   return head;
 }
 
-async function assertBranchNotCheckedOut(
+/** Strictly proves that no linked worktree's symbolic HEAD owns this canonical local branch ref. */
+export async function assertBranchNotCheckedOut(
   runner: GitRunner,
   snapshot: RepositorySnapshot,
   branchRef: string,

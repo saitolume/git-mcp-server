@@ -4,12 +4,47 @@ import { tmpdir } from "node:os";
 import { delimiter, join } from "node:path";
 import { spawnSync } from "node:child_process";
 import test from "node:test";
+import { gitPushForceWithLeaseInput } from "../src/domain/inputs.js";
+import { TOOL_CATALOG } from "../src/mcp/tool-catalog.js";
 import { repositoryRoot } from "./package-test-utils.js";
 
 const EXPECTED_DEPENDENCIES = {
   "@modelcontextprotocol/server": "2.0.0-beta.4",
   zod: "4.4.3",
 };
+
+test("force-with-lease is a separate destructive typed boundary", () => {
+  const valid = {
+    repository: "/repo",
+    request_id: "018f47d2-7b2a-7d75-b9dd-5ea8abca0150",
+    expected_branch: "feature/history",
+    expected_head: "b".repeat(40),
+    expected_remote_head: "a".repeat(40),
+  };
+  assert.equal(gitPushForceWithLeaseInput.safeParse(valid).success, true);
+  for (const extra of [
+    { remote: "other" },
+    { refspec: ":refs/heads/main" },
+    { force: true },
+    { delete: true },
+    { tags: true },
+    { args: ["--force"] },
+  ]) {
+    assert.equal(gitPushForceWithLeaseInput.safeParse({ ...valid, ...extra }).success, false);
+  }
+  assert.deepEqual(TOOL_CATALOG.git_push_force_with_lease.annotations, {
+    readOnlyHint: false,
+    destructiveHint: true,
+    idempotentHint: false,
+    openWorldHint: true,
+  });
+  assert.deepEqual(TOOL_CATALOG.git_push.annotations, {
+    readOnlyHint: false,
+    destructiveHint: false,
+    idempotentHint: false,
+    openWorldHint: true,
+  });
+});
 
 function runNodeScript(script: string, args: readonly string[] = [], env: NodeJS.ProcessEnv = process.env) {
   return spawnSync(process.execPath, [join(repositoryRoot, "scripts", script), ...args], {

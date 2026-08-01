@@ -37,6 +37,19 @@ function invalidRefText(value: string): boolean {
   return /[\x00-\x20\x7f~^:?*\\]/u.test(value) || value.includes("[") || !isWellFormedGitText(value);
 }
 
+/** Validates one complete native ref name without accepting revision syntax or pseudo refs. */
+export function validateFullRef(ref: string): string {
+  if (!ref.startsWith("refs/") || ref.length <= "refs/".length || ref.length > 4096
+    || !isWellFormedGitText(ref) || /[\x00-\x20\x7f~^:?*\[\\]/.test(ref) || ref.includes("..")
+    || ref.includes("@{") || ref.endsWith("/") || ref.endsWith(".")) {
+    throw new Error("ref is invalid");
+  }
+  const components = ref.split("/");
+  if (components.some((component) => component.length === 0 || component.startsWith(".")
+    || component.endsWith(".") || component.endsWith(".lock"))) throw new Error("ref is invalid");
+  return ref;
+}
+
 /** Validates a branch suffix without invoking Git and returns its canonical full ref. */
 export function canonicalBranchRef(branch: string): string {
   const ref = `refs/heads/${branch}`;
@@ -117,6 +130,51 @@ export interface IndexStageMap {
   readonly uncapturedFingerprint: string;
 }
 
+/** Rejects index visibility flags that make porcelain status omit tracked worktree changes. */
+export async function assertNoHiddenIndexEntries(
+  runner: GitRunner,
+  repository: string,
+  signal?: AbortSignal,
+): Promise<string> {
+  const args = ["ls-files", "--cached", "-v", "-z"];
+  let hidden = false;
+  const proof = createHash("sha256").update("git-mcp-server:index-visibility:v1\0");
+  const malformed = (): never => { throw outputFailure(args); };
+  const parser = new DelimitedRecordParser(0, COMPLETE_RECORD_MAX_BYTES, "Git index visibility map", (record) => {
+    throwIfDeadlineExceeded(signal);
+    if (record.length < 3 || record[1] !== " " || !/^[A-Za-z?]$/.test(record[0]!)
+      || !isWellFormedGitText(record.slice(2))) malformed();
+    const tag = record[0]!;
+    if (tag === "S" || /^[a-z]$/.test(tag)) hidden = true;
+    proof.update(record).update("\0");
+  });
+  let result: GitCommandResult;
+  try {
+    result = await runner.runStreaming({
+      cwd: repository,
+      args,
+      timeoutMs: remainingDeadlineTimeoutMs(OPERATION_TIMEOUT_MS.read),
+      maxStderrBytes: STREAM_STDERR_MAX_BYTES,
+    }, (chunk) => parser.write(chunk), signal);
+  } catch (error) {
+    if (error instanceof BridgeRejection) throw error;
+    if (signal?.aborted) throwIfDeadlineExceeded(signal);
+    return malformed();
+  }
+  if (result.exitCode !== 0 || result.signal !== null || result.timedOut || result.aborted) {
+    throw commandFailure(args, result);
+  }
+  if (result.stdoutTruncated || result.stderrTruncated || result.stderr !== "") malformed();
+  try { parser.finish(); } catch { malformed(); }
+  if (hidden) {
+    throw new BridgeRejection({
+      code: "UNSUPPORTED_REPOSITORY_STATE",
+      message: "Tracked entries with assume-unchanged or skip-worktree cannot be content-proven",
+    });
+  }
+  return proof.digest("hex");
+}
+
 function updateIndexHash(hash: ReturnType<typeof createHash>, entry: IndexStageRecord): void {
   hash.update(entry.mode).update("\0").update(entry.objectId).update("\0")
     .update(entry.stage).update("\0").update(entry.path).update("\0");
@@ -136,6 +194,7 @@ export async function readIndexStageMap(
   signal?: AbortSignal,
   capturePaths: ReadonlySet<string> = new Set(),
   captureGitlinks = false,
+  captureAll = false,
 ): Promise<IndexStageMap> {
   const args = ["ls-files", "--stage", "-z"];
   const indexHash = createHash("sha256").update("git-mcp-server:index-stage-map:v2\0");
@@ -168,7 +227,7 @@ export async function readIndexStageMap(
     previousStage = numericStage;
     stagesForPath |= 1 << numericStage;
     const entry: IndexStageRecord = { mode, objectId, stage, path };
-    const shouldCapture = capturePaths.has(path) || (captureGitlinks && mode === "160000");
+    const shouldCapture = captureAll || capturePaths.has(path) || (captureGitlinks && mode === "160000");
     updateIndexHash(indexHash, entry);
     if (!shouldCapture) updateIndexHash(uncapturedHash, entry);
     if (stage === "0") updateTreeHash(treeHash, entry);

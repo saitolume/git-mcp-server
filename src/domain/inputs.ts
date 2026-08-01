@@ -9,7 +9,7 @@ export const absoluteRepositoryPath = gitTransportText.min(1).refine(
   (value) => value.startsWith("/"),
   "repository must be absolute",
 ).describe("Absolute filesystem path to the target Git worktree; it must start with '/'.");
-export const objectId = z.string().regex(/^[0-9a-f]{40,64}$/)
+export const objectId = z.string().regex(/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/)
   .describe("Full lowercase 40- or 64-hex Git object ID.");
 export const requestId = z.uuid()
   .describe("Client-generated UUID used as the durable idempotency and replay identity.");
@@ -76,15 +76,29 @@ export const gitSwitchCreateInput = z.strictObject({
     .describe("New local branch name to create from the exact expected HEAD; existing or invalid refs are rejected."),
 });
 
-const attachBranchName = gitTransportText.min(1)
-  .refine((value) => value !== "HEAD" && !value.startsWith("refs/"), "branch must be a local branch name, not a ref expression")
-  .describe("Existing local branch name to attach; HEAD, refs/* names, arbitrary ref expressions, and invalid Git branch names are forbidden.");
+function isLocalBranchName(value: string): boolean {
+  if (value === "HEAD" || value.startsWith("refs/") || value.startsWith("-") || value.length === 0) return false;
+  const ref = `refs/heads/${value}`;
+  const parts = ref.split("/");
+  return ref.length <= 1024
+    && !ref.endsWith(".")
+    && !ref.includes("..")
+    && !ref.includes("@{")
+    && !/[\x00-\x20\x7f~^:?*\\]/u.test(ref)
+    && !ref.includes("[")
+    && parts.length >= 3
+    && parts.every((part) => part.length > 0 && !part.startsWith(".") && !part.endsWith(".lock"));
+}
+
+export const localBranchName = gitTransportText.min(1)
+  .refine(isLocalBranchName, "branch must be a canonical local branch name")
+  .describe("Canonical local branch name accepted by Git check-ref-format --branch; HEAD, refs/* names, ref expressions, invalid ref components, and ambiguous Unicode are forbidden.");
 
 export const gitSwitchAttachInput = z.strictObject({
   ...mutationBase,
   expected_branch: z.literal(null)
     .describe("Required null literal proving the caller expects the current worktree to be detached."),
-  branch: attachBranchName,
+  branch: localBranchName,
   expected_branch_head: objectId
     .describe("Exact full object ID expected at the existing local branch before attachment."),
 });
@@ -146,6 +160,52 @@ export const gitPushInput = z.strictObject({
     .describe("Exact expected origin branch head for atomic lease comparison, or null only when the branch is expected absent."),
 });
 
+export const gitCommitRangeValidateInput = z.strictObject({
+  ...mutationBase,
+  base: objectId.describe("Exact base commit object ID for the guarded reachable commit range."),
+}).refine(
+  ({ base, expected_head }) => base.length === expected_head.length,
+  "base and expected_head must use the same object ID width",
+);
+
+export const gitRewordInput = z.strictObject({
+  ...mutationBase,
+  base: objectId.describe("Exact base commit object ID immediately before the commits to reword."),
+  commits: z.array(z.strictObject({
+    commit: objectId.describe("Exact original commit object ID in the validated reword sequence."),
+    message: gitTransportText.min(1).max(100_000)
+      .describe("Replacement commit message passed only on standard input; it must contain 1 through 100000 characters."),
+  })).min(1).max(128)
+    .describe("Ordered sequence of 1 through 128 validated commits and replacement messages."),
+  destination: z.discriminatedUnion("mode", [
+    z.strictObject({
+      mode: z.literal("current_branch").describe("Rewrite the currently checked-out branch."),
+    }),
+    z.strictObject({
+      mode: z.literal("new_branch").describe("Create the rewrite result on a new local branch."),
+      branch: localBranchName.describe("New canonical local branch name for the rewrite result."),
+    }),
+  ]).describe("Destination mode: rewrite the current branch or create a new canonical local branch."),
+}).refine(
+  ({ expected_head, base, commits }) => base.length === expected_head.length
+    && commits.every(({ commit }) => commit.length === expected_head.length),
+  "expected_head, base, and every commit must use one object ID width",
+);
+
+export const gitCommitAmendInput = z.strictObject({
+  ...mutationBase,
+  stage_id: nonEmptyId.describe("Owned normal-stage session ID whose exact staged index content will amend HEAD."),
+  worktree_snapshot_id: snapshotId.describe("Exact complete worktree snapshot guard required before amending HEAD."),
+  message: gitTransportText.min(1).max(100_000)
+    .describe("Replacement commit message passed only on standard input; it must contain 1 through 100000 characters."),
+});
+
+export const gitPushForceWithLeaseInput = z.strictObject({
+  ...mutationBase,
+  expected_remote_head: objectId.nullable()
+    .describe("Exact expected origin branch head for the force-with-lease comparison, or null only when the branch is expected absent."),
+});
+
 export const gitOperationGetInput = z.strictObject({
   request_id: requestId.describe("UUID of a previously durable Git mutation whose exact terminal result should be returned."),
 });
@@ -163,4 +223,8 @@ export type GitMergeInput = z.infer<typeof gitMergeInput>;
 export type GitMergeContinueInput = z.infer<typeof gitMergeContinueInput>;
 export type GitMergeAbortInput = z.infer<typeof gitMergeAbortInput>;
 export type GitPushInput = z.infer<typeof gitPushInput>;
+export type GitCommitRangeValidateInput = z.infer<typeof gitCommitRangeValidateInput>;
+export type GitRewordInput = z.infer<typeof gitRewordInput>;
+export type GitCommitAmendInput = z.infer<typeof gitCommitAmendInput>;
+export type GitPushForceWithLeaseInput = z.infer<typeof gitPushForceWithLeaseInput>;
 export type GitOperationGetInput = z.infer<typeof gitOperationGetInput>;

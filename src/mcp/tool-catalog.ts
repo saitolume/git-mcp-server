@@ -1,6 +1,9 @@
 import { z } from "zod";
 import {
   gitOperationGetInput,
+  gitCommitRangeValidateInput,
+  gitCommitAmendInput,
+  gitRewordInput,
   gitAddInput,
   gitCommitInput,
   gitDiffInput,
@@ -8,6 +11,7 @@ import {
   gitMergeAbortInput,
   gitMergeContinueInput,
   gitMergeInput,
+  gitPushForceWithLeaseInput,
   gitPushInput,
   gitRestoreStagedInput,
   gitRestoreWorktreeInput,
@@ -30,6 +34,9 @@ import {
   statusDataSchema,
   switchAttachDataSchema,
   switchCreateDataSchema,
+  commitRangeValidateDataSchema,
+  rewordDataSchema,
+  commitAmendDataSchema,
 } from "../domain/result.js";
 import { PRODUCT } from "../product.js";
 
@@ -37,6 +44,8 @@ export const TOOL_NAMES = [
   "git_status", "git_diff", "git_switch_create", "git_switch_attach", "git_add",
   "git_restore_staged", "git_restore_worktree", "git_commit", "git_fetch",
   "git_merge", "git_merge_continue", "git_merge_abort", "git_push",
+  "git_push_force_with_lease",
+  "git_commit_range_validate", "git_reword", "git_commit_amend",
   "git_operation_get",
 ] as const;
 
@@ -79,12 +88,17 @@ const openWorldMutationAnnotations = {
   openWorldHint: true,
 } as const;
 
+const destructiveOpenWorldMutationAnnotations = {
+  ...destructiveMutationAnnotations,
+  openWorldHint: true,
+} as const;
+
 const title = (name: string): string => `${PRODUCT.displayName}: ${name}`;
 
 export const TOOL_CATALOG = {
   git_status: {
     title: title("Git status"),
-    description: "Operation: Inspect repository status without mutation. Returns: repository_id, branch and HEAD, opaque index_tree, worktree_snapshot_id, and exact path entries. Defaults: inspect the complete repository status. Excludes: read-only; no index refresh or write, object creation, file contents, or remote access.",
+    description: "Operation: Inspect repository status without mutation. Returns: repository_id, branch and HEAD, opaque index_tree, a content-complete worktree_snapshot_id for non-ignored Git-visible tracked deviations, gitlinks, and untracked leaves, plus exact path entries. Defaults: inspect the complete repository status; ordinary untracked directories expand to leaves. Excludes: ignored and empty-directory paths are outside the snapshot; nested repository directory records and special filesystem nodes are rejected; read-only with no index refresh or write, object creation, returned file contents, or remote access.",
     inputSchema: gitStatusInput,
     outputSchema: bridgeResultSchema(statusDataSchema),
     annotations: readOnlyAnnotations,
@@ -172,6 +186,34 @@ export const TOOL_CATALOG = {
     inputSchema: gitPushInput,
     outputSchema: bridgeResultSchema(pushDataSchema),
     annotations: openWorldMutationAnnotations,
+  },
+  git_push_force_with_lease: {
+    title: title("Force push with lease"),
+    description: "Operation: Replace the same-name current branch on origin using an exact caller-observed remote-head lease, including a non-fast-forward update. Returns: request_id, repository_id, local_head, and remote_head object IDs. Defaults: origin and the current branch destination are fixed, the exact lease is internal, native pre-push hooks run, and the complete Git-visible worktree snapshot must remain stable. Excludes: caller remote, refspec, force options, tags, deletion, hook bypass, stale remote state, active sessions, and automatic retry.",
+    inputSchema: gitPushForceWithLeaseInput,
+    outputSchema: bridgeResultSchema(pushDataSchema),
+    annotations: destructiveOpenWorldMutationAnnotations,
+  },
+  git_commit_range_validate: {
+    title: title("Validate commit range"),
+    description: "Operation: Validate every commit in the exact linear base..HEAD range with the configured native commit-msg hook. Returns: request_id, repository_id, exact base and head IDs, count, and hook kind. Defaults: the current branch and HEAD must match exactly, and every range commit is checked in order. Excludes: reword, amend, force push, hook bypass, hook diagnostics, and success after any hook changes the index, worktree, or refs.",
+    inputSchema: gitCommitRangeValidateInput,
+    outputSchema: bridgeResultSchema(commitRangeValidateDataSchema),
+    annotations: mutationAnnotations,
+  },
+  git_reword: {
+    title: title("Reword commit range"),
+    description: "Operation: Recreate every commit in the exact linear base..HEAD range with replacement messages after native commit-msg validation, then move one local destination with exact CAS. Returns: request_id, repository_id, old and new object IDs, count, destination, tree-invariance proof, hook kind, and signing policy. Defaults: preserve every pairwise tree, parent mapping, author, and committer; current_branch moves the checked-out ref, while new_branch creates and switches to one absent local branch. Excludes: signed or merge commits, raw Git arguments, reset, rebase, stash, hook bypass, amend, force push, and automatic retry.",
+    inputSchema: gitRewordInput,
+    outputSchema: bridgeResultSchema(rewordDataSchema),
+    annotations: destructiveMutationAnnotations,
+  },
+  git_commit_amend: {
+    title: title("Amend staged changes"),
+    description: "Operation: Replace the exact current HEAD with the index owned by one stage_id after validating the complete worktree snapshot, using native hooks and signing disabled. Returns: request_id, repository_id, old and new commit/tree IDs, hook_changed_paths, and signing policy. Defaults: parent set, exact owned index tree, and unowned worktree content remain unchanged. Excludes: signed HEAD, implicit staging, another commit, raw Git arguments, hook bypass, push, stash, and automatic retry.",
+    inputSchema: gitCommitAmendInput,
+    outputSchema: bridgeResultSchema(commitAmendDataSchema),
+    annotations: destructiveMutationAnnotations,
   },
   git_operation_get: {
     title: title("Get operation"),

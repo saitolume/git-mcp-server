@@ -84,6 +84,14 @@ export function registerTools(
     invoke(context, active, (signal, report) => service.git_merge_abort(input, signal, report)));
   server.registerTool("git_push", TOOL_CATALOG.git_push, (input, context) =>
     invoke(context, active, (signal, report) => service.git_push(input, signal, report)));
+  server.registerTool("git_push_force_with_lease", TOOL_CATALOG.git_push_force_with_lease, (input, context) =>
+    invoke(context, active, (signal, report) => service.git_push_force_with_lease(input, signal, report)));
+  server.registerTool("git_commit_range_validate", TOOL_CATALOG.git_commit_range_validate, (input, context) =>
+    invoke(context, active, (signal, report) => service.git_commit_range_validate(input, signal, report)));
+  server.registerTool("git_reword", TOOL_CATALOG.git_reword, (input, context) =>
+    invoke(context, active, (signal, report) => service.git_reword(input, signal, report)));
+  server.registerTool("git_commit_amend", TOOL_CATALOG.git_commit_amend, (input, context) =>
+    invoke(context, active, (signal, report) => service.git_commit_amend(input, signal, report)));
   server.registerTool("git_operation_get", TOOL_CATALOG.git_operation_get, (input, context) =>
     invoke(context, active, (signal, report) => service.git_operation_get(input, signal, report)));
 

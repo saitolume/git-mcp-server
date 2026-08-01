@@ -23,6 +23,10 @@ const EXPECTED_TOOLS = [
   ["git_merge_continue", "git-mcp-server: Continue merge", { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false }],
   ["git_merge_abort", "git-mcp-server: Abort merge", { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false }],
   ["git_push", "git-mcp-server: Push branch", { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true }],
+  ["git_push_force_with_lease", "git-mcp-server: Force push with lease", { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true }],
+  ["git_commit_range_validate", "git-mcp-server: Validate commit range", { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false }],
+  ["git_reword", "git-mcp-server: Reword commit range", { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false }],
+  ["git_commit_amend", "git-mcp-server: Amend staged changes", { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false }],
   ["git_operation_get", "git-mcp-server: Get operation", { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false }],
 ] as const;
 
@@ -327,7 +331,8 @@ test("MCP stdio cancellation aborts a long-running Git process without corruptin
     { signal: controller.signal, timeout: 10_000 },
   );
   let started = false;
-  for (let attempt = 0; attempt < 100; attempt += 1) {
+  // Keep this below the 10-second tool timeout while tolerating full-suite process contention.
+  for (let attempt = 0; attempt < 500; attempt += 1) {
     try { await readFile(marker); started = true; break; }
     catch { await new Promise((resolve) => setTimeout(resolve, 10)); }
   }

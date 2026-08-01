@@ -78,7 +78,11 @@ commit, run `pnpm install --frozen-lockfile && pnpm build`, keep the absolute
 | `git_merge` | Merge an expected fetched `origin` tracking ref, or return a conflict session. |
 | `git_merge_continue` | Complete a declared merge session after resolved paths are staged. |
 | `git_merge_abort` | Destructively abort a declared in-progress merge session. |
-| `git_push` | Push an expected local branch head after checking the expected remote head. |
+| `git_push` | Push an expected local branch head after checking the expected remote head; it remains fast-forward-only. |
+| `git_push_force_with_lease` | Destructively replace the same-name branch on `origin` only with an exact caller-observed remote-head lease. |
+| `git_commit_range_validate` | Run the native `commit-msg` hook against every commit in one exact linear `base..HEAD` range. |
+| `git_reword` | Recreate an exact linear range with replacement messages, either on the current branch or a new local branch, while proving each tree is unchanged. |
+| `git_commit_amend` | Replace only the current unsigned commit with an owned stage session and guarded worktree snapshot. |
 | `git_operation_get` | Read the durable result for a request ID. |
 
 ## Typical workflow
@@ -104,6 +108,136 @@ another worktree. The current operation state must be `none`; the index and
 complete worktree, including untracked paths, must be clean; and no bridge
 session may be active.
 
+## Guarded history recovery examples
+
+Every object ID below is a full object ID and every `request_id` is a fixed
+example UUID. Replace the repository path, IDs, branch, messages, and request
+IDs with values from your own trusted repository. Build the implementing source
+commit with `pnpm install --frozen-lockfile && pnpm build`, retain the absolute
+`dist/cli.js` command, then restart the MCP server and client session before
+calling these new tools.
+
+First validate the exact current range; validation executes the repository's
+native `commit-msg` hook for every commit, in order:
+
+```json
+{
+  "tool": "git_commit_range_validate",
+  "arguments": {
+    "repository": "/absolute/path/to/repository",
+    "request_id": "018f47d2-7b2a-7d75-b9dd-5ea8abca0100",
+    "expected_branch": "feature/history-example",
+    "expected_head": "2222222222222222222222222222222222222222",
+    "base": "1111111111111111111111111111111111111111"
+  }
+}
+```
+
+For the current-branch route, reword the complete ordered range, then use the
+separate destructive delivery tool with the remote head you just observed. The
+force permission is a caller approval policy: a client or user may authorize
+this tool, but the bridge never decides to discard remote commits. An exact remote CAS is mandatory;
+provider or branch protection may still reject the update.
+
+Take a fresh observation immediately before delivery and use that exact remote
+head as the lease. If the remote CAS drifts, stop with the drift evidence
+preserved: perform no automatic refresh or retry. An explicit human decision is
+required before a new observation may be used to discard an externally added
+commit.
+
+```json
+{
+  "tool": "git_reword",
+  "arguments": {
+    "repository": "/absolute/path/to/repository",
+    "request_id": "018f47d2-7b2a-7d75-b9dd-5ea8abca0101",
+    "expected_branch": "feature/history-example",
+    "expected_head": "2222222222222222222222222222222222222222",
+    "base": "1111111111111111111111111111111111111111",
+    "commits": [{
+      "commit": "2222222222222222222222222222222222222222",
+      "message": "feat(history): clarify recovery"
+    }],
+    "destination": { "mode": "current_branch" }
+  }
+}
+```
+
+```json
+{
+  "tool": "git_push_force_with_lease",
+  "arguments": {
+    "repository": "/absolute/path/to/repository",
+    "request_id": "018f47d2-7b2a-7d75-b9dd-5ea8abca0102",
+    "expected_branch": "feature/history-example",
+    "expected_head": "3333333333333333333333333333333333333333",
+    "expected_remote_head": "2222222222222222222222222222222222222222"
+  }
+}
+```
+
+For the replacement-branch route, create and switch to a new local branch while
+leaving the original branch unchanged. It can then use ordinary `git_push`,
+which remains fast-forward-only and does not replace published history:
+
+```json
+{
+  "tool": "git_reword",
+  "arguments": {
+    "repository": "/absolute/path/to/repository",
+    "request_id": "018f47d2-7b2a-7d75-b9dd-5ea8abca0103",
+    "expected_branch": "feature/history-example",
+    "expected_head": "2222222222222222222222222222222222222222",
+    "base": "1111111111111111111111111111111111111111",
+    "commits": [{
+      "commit": "2222222222222222222222222222222222222222",
+      "message": "feat(history): clarify replacement route"
+    }],
+    "destination": { "mode": "new_branch", "branch": "feature/history-reworded" }
+  }
+}
+```
+
+```json
+{
+  "tool": "git_push",
+  "arguments": {
+    "repository": "/absolute/path/to/repository",
+    "request_id": "018f47d2-7b2a-7d75-b9dd-5ea8abca0104",
+    "expected_branch": "feature/history-reworded",
+    "expected_head": "3333333333333333333333333333333333333333",
+    "expected_remote_head": null
+  }
+}
+```
+
+To amend only the current commit, first create the normal stage session with
+`git_add`, retain its exact stage and snapshot IDs, and then call:
+
+```json
+{
+  "tool": "git_commit_amend",
+  "arguments": {
+    "repository": "/absolute/path/to/repository",
+    "request_id": "018f47d2-7b2a-7d75-b9dd-5ea8abca0105",
+    "expected_branch": "feature/history-example",
+    "expected_head": "2222222222222222222222222222222222222222",
+    "stage_id": "stage-example-20260801",
+    "worktree_snapshot_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "message": "fix(history): amend the owned staged change"
+  }
+}
+```
+
+Signed source commits are rejected; signing remains `disabled_by_policy`.
+Commit messages are redacted from durable request records, although the original
+message remains part of the request hash used for replay. Native `commit-msg`,
+`pre-commit`, reference-transaction, and pre-push hooks remain enabled; hook
+rejection is a redacted `HOOK_FAILED` result. The existing git_push remains fast-forward-only
+for backward compatibility. These additions are unreleased:
+do not infer an npm release, tag, or `latest` availability from this source
+change.
+
 ## Safety boundaries
 
 Use only trusted repositories. Inputs are explicit repository-relative paths
@@ -121,6 +255,19 @@ operations before approving them.
 The server is not an isolation boundary for intentionally malicious hooks
 running as the same operating-system user. Hook-failure redaction is a bounded
 result contract for trusted repositories, not a sandbox for hostile hook code.
+
+Exact worktree snapshots fail closed when the index contains
+`assume-unchanged` or `skip-worktree` entries. Clear those flags before using
+status-derived mutation guards; Git may otherwise omit changed tracked paths
+from porcelain status. The bridge checks the visibility map on both sides of
+the status read and includes every tracked path in the content proof. Amend
+reconciliation captures native `HEAD` with the bridge-selected absolute Git
+executable before the repository `post-commit` hook, then requires that exact
+commit object afterward; Git's native message cleanup remains supported while
+post-commit metadata or message substitution fails closed. Push execution binds the prepared endpoint through a
+random child-only alias so ambient Git URL rewrite rules cannot retarget the
+approved operation after preflight. This does not change the caller-visible
+remote, refspec, lease, or native pre-push hook contract.
 
 When a native `pre-commit` or `commit-msg` hook rejects a commit,
 `git_commit` returns `status: "failed"` with `error.code: "HOOK_FAILED"`.

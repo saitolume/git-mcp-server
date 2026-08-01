@@ -9,6 +9,7 @@ import {
   absoluteRepositoryPath,
   gitOutputPath,
   gitTransportText,
+  localBranchName,
   objectId,
   originRemoteRef,
   relativeGitPath,
@@ -223,6 +224,48 @@ export const pushDataSchema = z.strictObject({
   remote_head: objectId,
 });
 
+export const commitRangeValidateDataSchema = z.strictObject({
+  base: objectId,
+  head: objectId,
+  commit_count: z.number().int().min(1).max(128),
+  hook: z.literal("commit-msg"),
+}).refine(
+  ({ base, head }) => base.length === head.length,
+  "base and head must use the same object ID width",
+);
+
+export const rewordDataSchema = z.strictObject({
+  base: objectId,
+  old_head: objectId,
+  head: objectId,
+  commit_count: z.number().int().min(1).max(128),
+  destination: z.discriminatedUnion("mode", [
+    z.strictObject({ mode: z.literal("current_branch"), branch: localBranchName }),
+    z.strictObject({ mode: z.literal("new_branch"), branch: localBranchName, source_branch: localBranchName }),
+  ]),
+  trees_unchanged: z.literal(true),
+  hook: z.literal("commit-msg"),
+  signing: z.literal("disabled_by_policy"),
+}).refine(
+  ({ base, old_head, head }) => base.length === old_head.length && old_head.length === head.length,
+  "base, old_head, and head must use one object ID width",
+);
+
+export const commitAmendDataSchema = z.strictObject({
+  old_commit: objectId,
+  commit: objectId,
+  old_tree: objectId,
+  tree: objectId,
+  hook_changed_paths: returnedGitOutputPaths,
+  signing: z.literal("disabled_by_policy"),
+}).refine(
+  ({ old_commit, commit, old_tree, tree }) =>
+    old_commit.length === commit.length
+      && commit.length === old_tree.length
+      && old_tree.length === tree.length,
+  "old_commit, commit, old_tree, and tree must use one object ID width",
+);
+
 const operationDataSchemas: Readonly<Record<string, z.ZodType>> = {
   git_status: statusDataSchema,
   git_diff: diffDataSchema,
@@ -237,6 +280,10 @@ const operationDataSchemas: Readonly<Record<string, z.ZodType>> = {
   git_merge_continue: mergeContinueDataSchema,
   git_merge_abort: mergeAbortDataSchema,
   git_push: pushDataSchema,
+  git_push_force_with_lease: pushDataSchema,
+  git_commit_range_validate: commitRangeValidateDataSchema,
+  git_reword: rewordDataSchema,
+  git_commit_amend: commitAmendDataSchema,
 };
 
 /** Validates persisted data against the exact public output schema for its operation. */
@@ -261,4 +308,7 @@ export type MergeData = z.infer<typeof mergeDataSchema>;
 export type MergeContinueData = z.infer<typeof mergeContinueDataSchema>;
 export type MergeAbortData = z.infer<typeof mergeAbortDataSchema>;
 export type PushData = z.infer<typeof pushDataSchema>;
+export type CommitRangeValidateData = z.infer<typeof commitRangeValidateDataSchema>;
+export type RewordData = z.infer<typeof rewordDataSchema>;
+export type CommitAmendData = z.infer<typeof commitAmendDataSchema>;
 export type StatusEntry = z.infer<typeof statusEntrySchema>;

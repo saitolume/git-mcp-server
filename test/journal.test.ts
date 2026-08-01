@@ -511,6 +511,36 @@ test("operation journal never persists a raw commit message but hashes it for re
   assert.equal(replay.kind, "replay");
 });
 
+test("operation journal redacts every guarded-history replacement message while retaining the original request hash", async (t) => {
+  const paths = await temporaryState(t);
+  const journal = new OperationJournal(paths, { now: () => timestamp, pid: 123 });
+  const reword = {
+    requestId: "reword-message-secret", operation: "git_reword", repositoryId,
+    input: {
+      repository: "/repo", expected_branch: "main", expected_head: objectId, base: objectId,
+      commits: [{ commit: objectId, message: "reword synthetic secret" }], destination: { mode: "current_branch" },
+    },
+  };
+  const amend = {
+    requestId: "amend-message-secret", operation: "git_commit_amend", repositoryId,
+    input: {
+      repository: "/repo", expected_branch: "main", expected_head: objectId, stage_id: "stage-1",
+      worktree_snapshot_id: "a".repeat(64), message: "amend synthetic secret",
+    },
+  };
+  await journal.begin(reword);
+  await journal.begin(amend);
+  const persisted = await Promise.all([reword, amend].map(async ({ requestId }) =>
+    readFile(join(paths.operations, requestId, "request.json"), "utf8")));
+  for (const value of persisted) {
+    assert.match(value, /\[COMMIT_MESSAGE_REDACTED\]/);
+    assert.doesNotMatch(value, /synthetic secret/);
+  }
+  await assert.rejects(journal.begin({
+    ...reword, input: { ...reword.input, commits: [{ commit: objectId, message: "different synthetic secret" }] },
+  }), (error) => error instanceof BridgeRejection && error.error.code === "REQUEST_ID_REUSED");
+});
+
 test("operation journal preserves validated colon paths and rejects malformed operation output", async (t) => {
   const paths = await temporaryState(t);
   const journal = new OperationJournal(paths, { now: () => timestamp, pid: 123 });
@@ -541,6 +571,74 @@ test("operation journal preserves validated colon paths and rejects malformed op
     operation: "git_commit", data: { commit: objectId }, warnings: [],
   }), /output|data|tree|signing/i);
   assert.equal(await journal.get("invalid-output"), null);
+});
+
+test("operation journal enforces the bounded commit-range validation result", async (t) => {
+  const paths = await temporaryState(t);
+  const journal = new OperationJournal(paths, { now: () => timestamp, pid: 123 });
+  const valid = { requestId: "range-128", operation: "git_commit_range_validate", repositoryId, input: {} };
+  await journal.begin(valid);
+  const result = {
+    status: "succeeded" as const, request_id: valid.requestId, repository_id: repositoryId,
+    operation: valid.operation, data: {
+      base: objectId, head: "c".repeat(40), commit_count: 128, hook: "commit-msg" as const,
+    }, warnings: [],
+  };
+  await journal.complete(valid.requestId, result);
+  const replay = await journal.begin(valid);
+  assert.equal(replay.kind, "replay");
+
+  const invalid = { requestId: "range-129", operation: "git_commit_range_validate", repositoryId, input: {} };
+  await journal.begin(invalid);
+  await assert.rejects(journal.complete(invalid.requestId, {
+    ...result, request_id: invalid.requestId, data: { ...result.data, commit_count: 129 },
+  }), /output|data|commit_count/i);
+  assert.equal(await journal.get(invalid.requestId), null);
+  await writeFile(join(paths.operations, invalid.requestId, "result.json"), JSON.stringify({
+    requestId: invalid.requestId, completedAt: timestamp,
+    result: { ...result, request_id: invalid.requestId, data: { ...result.data, commit_count: 129 } },
+  }));
+  await assert.rejects(journal.get(invalid.requestId), /output|data|commit_count/i);
+
+  for (const [name, base, head] of [
+    ["non-exact-base", "a".repeat(41), "c".repeat(40)],
+    ["non-exact-head", objectId, "c".repeat(63)],
+    ["mixed-40-64", objectId, "c".repeat(64)],
+    ["mixed-64-40", "a".repeat(64), "c".repeat(40)],
+  ] as const) {
+    const malformed = { requestId: `range-${name}`, operation: "git_commit_range_validate", repositoryId, input: {} };
+    await journal.begin(malformed);
+    const malformedResult = {
+      ...result, request_id: malformed.requestId, data: { ...result.data, base, head },
+    };
+    await assert.rejects(journal.complete(malformed.requestId, malformedResult), /output|data|base|head/i, name);
+    assert.equal(await journal.get(malformed.requestId), null, name);
+    await writeFile(join(paths.operations, malformed.requestId, "result.json"), JSON.stringify({
+      requestId: malformed.requestId, completedAt: timestamp, result: malformedResult,
+    }));
+    await assert.rejects(journal.get(malformed.requestId), /output|data|base|head/i, name);
+  }
+});
+
+test("operation journal rejects mixed-width reword publication and manual replay", async (t) => {
+  const paths = await temporaryState(t);
+  const journal = new OperationJournal(paths, { now: () => timestamp, pid: 123 });
+  const request = { requestId: "reword-mixed-width", operation: "git_reword", repositoryId, input: {} };
+  await journal.begin(request);
+  const result = {
+    status: "succeeded" as const, request_id: request.requestId, repository_id: repositoryId,
+    operation: request.operation, data: {
+      base: "a".repeat(40), old_head: "b".repeat(40), head: "c".repeat(64), commit_count: 1,
+      destination: { mode: "current_branch" as const, branch: "feature/history" },
+      trees_unchanged: true as const, hook: "commit-msg" as const, signing: "disabled_by_policy" as const,
+    }, warnings: [],
+  };
+  await assert.rejects(journal.complete(request.requestId, result), /output|data|head/i);
+  assert.equal(await journal.get(request.requestId), null);
+  await writeFile(join(paths.operations, request.requestId, "result.json"), JSON.stringify({
+    requestId: request.requestId, completedAt: timestamp, result,
+  }));
+  await assert.rejects(journal.get(request.requestId), /output|data|head/i);
 });
 
 test("request-only journal state resumes execution while started state becomes durable indeterminate", async (t) => {

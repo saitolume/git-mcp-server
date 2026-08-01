@@ -56,11 +56,22 @@ const INDETERMINATE_MESSAGE = "The operation started but no terminal result was 
 
 function sanitizeOperationInput(operation: string, input: unknown): unknown {
   const sanitized = sanitizePersistentJson(input);
-  if (operation !== "git_commit" || sanitized === null || typeof sanitized !== "object" || Array.isArray(sanitized)
-    || Object.getPrototypeOf(sanitized) !== Object.prototype || !Object.hasOwn(sanitized, "message")) {
+  if (sanitized === null || typeof sanitized !== "object" || Array.isArray(sanitized)
+    || Object.getPrototypeOf(sanitized) !== Object.prototype) {
     return sanitized;
   }
-  return { ...(sanitized as Record<string, unknown>), message: COMMIT_MESSAGE_PLACEHOLDER };
+  const record = sanitized as Record<string, unknown>;
+  if ((operation === "git_commit" || operation === "git_commit_amend") && Object.hasOwn(record, "message")) {
+    return { ...record, message: COMMIT_MESSAGE_PLACEHOLDER };
+  }
+  if (operation !== "git_reword" || !Array.isArray(record.commits)) return sanitized;
+  return {
+    ...record,
+    commits: record.commits.map((commit) => commit !== null && typeof commit === "object" && !Array.isArray(commit)
+      && Object.getPrototypeOf(commit) === Object.prototype && Object.hasOwn(commit, "message")
+      ? { ...(commit as Record<string, unknown>), message: COMMIT_MESSAGE_PLACEHOLDER }
+      : commit),
+  };
 }
 
 async function syncDirectory(directory: string): Promise<void> {

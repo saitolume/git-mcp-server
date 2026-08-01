@@ -12,12 +12,30 @@ export interface GitCommand {
   readonly timeoutMs: number;
   readonly maxOutputBytes: number;
   readonly stdin?: string;
+  /** Internal-only identity binding for deterministic commit object creation. */
+  readonly commitIdentity?: {
+    readonly authorName: string;
+    readonly authorEmail: string;
+    readonly authorDate: string;
+    readonly committerName: string;
+    readonly committerEmail: string;
+    readonly committerDate: string;
+  };
   /** Internal streaming hook. When present, stdout is drained here instead of retained. */
   readonly stdoutConsumer?: (chunk: Buffer) => void;
   /** Internal native-hook wrapper binding. The original hook child never inherits fd 3. */
   readonly hookExecution?: {
     readonly wrappersDirectory: string;
     readonly failureConsumer: (chunk: Buffer) => void;
+    /** Internal-only framed native HEAD captured before the repository post-commit hook. */
+    readonly nativeCommitConsumer?: (chunk: Buffer) => void;
+    /** Internal-only endpoint passed to the Git-invoked pre-push adapter. */
+    readonly prePushEndpoint?: string;
+    /** Internal-only one-use Git URL rewrite that binds a prepared push endpoint. */
+    readonly preparedPushEndpointBinding?: {
+      readonly alias: string;
+      readonly endpoint: string;
+    };
   };
 }
 
@@ -106,6 +124,11 @@ export class GitRunner {
     this.processGroupExists = options.processGroupExists ?? processGroupExists;
   }
 
+  /** Absolute executable selected by the bridge, for private hook wrappers only. */
+  gitExecutablePath(): string {
+    return this.executablePath;
+  }
+
   async run(command: GitCommand, signal?: AbortSignal): Promise<GitCommandResult> {
     const startedAt = Date.now();
     let effectiveSignal = deadlineSignal(signal);
@@ -131,20 +154,49 @@ export class GitRunner {
     const child = spawn(this.executablePath, command.args, {
       cwd: command.cwd,
       env: command.hookExecution === undefined
-        ? this.environment
+        ? command.commitIdentity === undefined ? this.environment : {
+          ...this.environment,
+          GIT_AUTHOR_NAME: assertWellFormedGitText(command.commitIdentity.authorName, "Commit author name"),
+          GIT_AUTHOR_EMAIL: assertWellFormedGitText(command.commitIdentity.authorEmail, "Commit author email"),
+          GIT_AUTHOR_DATE: assertWellFormedGitText(command.commitIdentity.authorDate, "Commit author date"),
+          GIT_COMMITTER_NAME: assertWellFormedGitText(command.commitIdentity.committerName, "Commit committer name"),
+          GIT_COMMITTER_EMAIL: assertWellFormedGitText(command.commitIdentity.committerEmail, "Commit committer email"),
+          GIT_COMMITTER_DATE: assertWellFormedGitText(command.commitIdentity.committerDate, "Commit committer date"),
+        }
         : {
           ...this.environment,
-          GIT_CONFIG_COUNT: "1",
+          GIT_CONFIG_COUNT: command.hookExecution.preparedPushEndpointBinding === undefined ? "1" : "2",
           GIT_CONFIG_KEY_0: "core.hooksPath",
           GIT_CONFIG_VALUE_0: command.hookExecution.wrappersDirectory,
+          ...(command.hookExecution.preparedPushEndpointBinding === undefined ? {} : {
+            GIT_CONFIG_KEY_1: `url.${assertWellFormedGitText(
+              command.hookExecution.preparedPushEndpointBinding.endpoint,
+              "Prepared push endpoint",
+            )}.pushInsteadOf`,
+            GIT_CONFIG_VALUE_1: assertWellFormedGitText(
+              command.hookExecution.preparedPushEndpointBinding.alias,
+              "Prepared push endpoint alias",
+            ),
+          }),
+          ...(command.hookExecution.prePushEndpoint === undefined ? {} : {
+            GIT_MCP_PREPARED_PUSH_ENDPOINT: assertWellFormedGitText(
+              command.hookExecution.prePushEndpoint,
+              "Prepared push endpoint",
+            ),
+          }),
         },
       shell: false,
       detached: process.platform !== "win32",
       stdio: command.hookExecution === undefined
         ? ["pipe", "pipe", "pipe"]
-        : ["pipe", "pipe", "pipe", "pipe"],
+        : command.hookExecution.nativeCommitConsumer === undefined
+          ? ["pipe", "pipe", "pipe", "pipe"]
+          : ["pipe", "pipe", "pipe", "pipe", "pipe"],
     });
     const hookFailure = command.hookExecution === undefined ? null : child.stdio[3] as Readable | null;
+    const nativeCommit = command.hookExecution?.nativeCommitConsumer === undefined
+      ? null
+      : child.stdio[4] as Readable | null;
 
     let consumerError: Error | undefined;
     let failConsumer = (error: unknown): void => {
@@ -162,6 +214,10 @@ export class GitRunner {
     hookFailure?.on("data", (chunk: Buffer) => {
       try { command.hookExecution?.failureConsumer(chunk); }
       catch { /* A classification-channel failure cannot alter the Git operation. */ }
+    });
+    nativeCommit?.on("data", (chunk: Buffer) => {
+      try { command.hookExecution?.nativeCommitConsumer?.(chunk); }
+      catch (error) { failConsumer(error); }
     });
     child.stdin.on("error", () => undefined);
     child.stdin.end(command.stdin);

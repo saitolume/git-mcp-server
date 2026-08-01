@@ -73,7 +73,7 @@ interface PreparedState {
   readonly preOwnedEntries: ReadonlyMap<string, CommitTreeEntry>;
 }
 
-interface CommitTreeEntry {
+export interface CommitTreeEntry {
   readonly mode: IndexStageRecord["mode"];
   readonly objectId: string;
   readonly path: string;
@@ -92,7 +92,7 @@ function reject(
   throw new BridgeRejection({ code, message, ...(details === undefined ? {} : { details }) });
 }
 
-function assertIdentity(expected: RepositorySnapshot, actual: RepositorySnapshot): void {
+export function assertCommitIdentity(expected: RepositorySnapshot, actual: RepositorySnapshot): void {
   if (actual.repositoryId !== expected.repositoryId || actual.root !== expected.root
     || actual.gitDir !== expected.gitDir || actual.commonGitDir !== expected.commonGitDir) {
     reject("UNSUPPORTED_REPOSITORY_STATE", "Repository identity changed before commit");
@@ -104,12 +104,12 @@ function completeRead(result: GitCommandResult): boolean {
     && !result.stdoutTruncated && !result.stderrTruncated && result.stderr === "" && !result.stdout.includes("�");
 }
 
-interface PathSetProof {
+export interface PathSetProof {
   readonly count: number;
   readonly fingerprint: string;
 }
 
-function expectedPathSetProof(paths: readonly string[]): PathSetProof {
+export function expectedPathSetProof(paths: readonly string[]): PathSetProof {
   const sorted = [...paths].sort((left, right) => Buffer.compare(Buffer.from(left), Buffer.from(right)));
   if (new Set(sorted).size !== sorted.length) throw new Error("Persisted staged path set contains duplicates");
   const hash = createHash("sha256").update("git-mcp-server:path-set:v1\0");
@@ -117,7 +117,7 @@ function expectedPathSetProof(paths: readonly string[]): PathSetProof {
   return { count: sorted.length, fingerprint: hash.digest("hex") };
 }
 
-async function readStagedPathProof(runner: GitRunner, root: string, signal?: AbortSignal): Promise<PathSetProof> {
+export async function readStagedPathProof(runner: GitRunner, root: string, signal?: AbortSignal): Promise<PathSetProof> {
   const hash = createHash("sha256").update("git-mcp-server:path-set:v1\0");
   let count = 0;
   let previous: Buffer | undefined;
@@ -142,7 +142,7 @@ async function readStagedPathProof(runner: GitRunner, root: string, signal?: Abo
   return { count, fingerprint: hash.digest("hex") };
 }
 
-function assertStage(record: StageRecord, snapshot: RepositorySnapshot, input: CommitRequest): void {
+export function assertExactStage(record: StageRecord, snapshot: RepositorySnapshot, input: CommitRequest): void {
   if (record.repositoryId !== snapshot.repositoryId || record.stageId !== input.stageId
     || record.branch !== input.expectedBranch || record.baseHead !== input.expectedHead) {
     reject("SESSION_MISMATCH", "Stage session does not match the repository, branch, or base HEAD");
@@ -192,7 +192,7 @@ async function readLine(runner: GitRunner, root: string, args: readonly string[]
   return line;
 }
 
-async function readHooksPath(runner: GitRunner, root: string, signal?: AbortSignal): Promise<string> {
+export async function readHooksPath(runner: GitRunner, root: string, signal?: AbortSignal): Promise<string> {
   const result = await runner.run({
     cwd: root,
     args: ["rev-parse", "--path-format=absolute", "--git-path", "hooks"],
@@ -207,12 +207,12 @@ async function readHooksPath(runner: GitRunner, root: string, signal?: AbortSign
   return path;
 }
 
-interface CommitTreeProof {
+export interface CommitTreeProof {
   readonly fingerprint: string;
   readonly capturedEntries: ReadonlyMap<string, CommitTreeEntry>;
 }
 
-async function readCommitTreeProof(
+export async function readCommitTreeProof(
   runner: GitRunner,
   root: string,
   commit: string,
@@ -251,7 +251,7 @@ async function readCommitTreeProof(
   return { fingerprint: hash.digest("hex"), capturedEntries: captured };
 }
 
-async function hookChangedPaths(
+export async function hookChangedPaths(
   runner: GitRunner,
   root: string,
   baseHead: string,
@@ -317,9 +317,9 @@ export async function prepareCommit(
   if (record === null) reject("SESSION_NOT_FOUND", "Stage session was not found", { stageId: input.stageId });
 
   const before = await inspectRepository(runner, snapshot.root, signal);
-  assertIdentity(snapshot, before);
+  assertCommitIdentity(snapshot, before);
   assertMutationReady(before, input.expectedBranch, input.expectedHead);
-  assertStage(record, before, input);
+  assertExactStage(record, before, input);
   await sessions.assertActiveStage(record);
   const expectedPaths = expectedPathSetProof(record.ownedPaths);
   const stagedPaths = await readStagedPathProof(runner, before.root, signal);
@@ -328,9 +328,9 @@ export async function prepareCommit(
   }
 
   const finalBefore = await inspectRepository(runner, before.root, signal);
-  assertIdentity(before, finalBefore);
+  assertCommitIdentity(before, finalBefore);
   assertMutationReady(finalBefore, input.expectedBranch, input.expectedHead);
-  assertStage(record, finalBefore, input);
+  assertExactStage(record, finalBefore, input);
   const finalPaths = await readStagedPathProof(runner, finalBefore.root, signal);
   if (finalPaths.count !== expectedPaths.count || finalPaths.fingerprint !== expectedPaths.fingerprint) {
     reject("SESSION_MISMATCH", "Stage ownership changed while preparing the commit");
